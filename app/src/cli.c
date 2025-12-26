@@ -114,6 +114,7 @@ enum {
     OPT_NO_VD_SYSTEM_DECORATIONS,
     OPT_NO_VD_DESTROY_CONTENT,
     OPT_DISPLAY_IME_POLICY,
+    OPT_AUDIO_IGNORE_APPS,
 };
 
 struct sc_option {
@@ -212,6 +213,15 @@ static const struct sc_option options[] = {
         .text = "Use a specific MediaCodec audio encoder (depending on the "
                 "codec provided by --audio-codec).\n"
                 "The available encoders can be listed by --list-encoders.",
+    },
+    {
+        .longopt_id = OPT_AUDIO_IGNORE_APPS,
+        .longopt = "audio-ignore-apps",
+        .argdesc = "pkg",
+        .text = "Ignore specific applications for AppMonitor (audio isolation).\n"
+                "When these apps are detected, AppMonitor switches to Global "
+                "Capture (UID -1) to prevent audio stream issues.\n"
+                "Can be comma-separated list.",
     },
     {
         .longopt_id = OPT_AUDIO_SOURCE,
@@ -2608,6 +2618,12 @@ parse_args_with_getopt(struct scrcpy_cli_args *args, int argc, char *argv[],
                 break;
             case OPT_AUDIO_ENCODER:
                 opts->audio_encoder = optarg;
+                break;
+            case OPT_AUDIO_IGNORE_APPS:
+                options->audio_ignore_apps = optarg;
+                break;
+            case OPT_AUDIO_FILTER_APPS:
+                options->audio_filter_apps = optarg;
                 break;
             case OPT_FORCE_ADB_FORWARD:
                 opts->force_adb_forward = true;

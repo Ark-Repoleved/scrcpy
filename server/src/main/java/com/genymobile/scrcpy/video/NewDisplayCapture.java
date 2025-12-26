@@ -245,6 +245,18 @@ public class NewDisplayCapture extends SurfaceCapture {
                                 break;
                             }
                         }
+
+                    }
+
+                    if (!foundTopApp) {
+                        if (!"SYSTEM".equals(lastPackageName)) {
+                            Ln.i("No app detected on display " + displayId + ", switching to Global Audio");
+                            lastPackageName = "SYSTEM";
+                            if (lastUid != -1) {
+                                audioCapture.setTargetUid(-1);
+                                lastUid = -1;
+                            }
+                        }
                     }
                     Thread.sleep(500);
                 } catch (InterruptedException e) {

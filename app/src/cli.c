@@ -225,6 +225,15 @@ static const struct sc_option options[] = {
                 "Can be comma-separated list.",
     },
     {
+        .longopt_id = OPT_AUDIO_FILTER_APPS,
+        .longopt = "audio-filter-apps",
+        .argdesc = "pkg",
+        .text = "Filter (ignore) applications for AppMonitor detection.\n"
+                "These apps will be completely ignored, allowing AppMonitor to "
+                "detect the app beneath them (e.g. for transparent overlays).\n"
+                "Can be comma-separated list.",
+    },
+    {
         .longopt_id = OPT_AUDIO_SOURCE,
         .longopt = "audio-source",
         .argdesc = "source",

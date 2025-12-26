@@ -98,6 +98,8 @@ enum {
     OPT_ORIENTATION,
     OPT_KEYBOARD,
     OPT_MOUSE,
+    OPT_AUDIO_IGNORE_APPS,
+    OPT_AUDIO_FILTER_APPS,
     OPT_HID_KEYBOARD_DEPRECATED,
     OPT_HID_MOUSE_DEPRECATED,
     OPT_NO_WINDOW,
@@ -2620,10 +2622,10 @@ parse_args_with_getopt(struct scrcpy_cli_args *args, int argc, char *argv[],
                 opts->audio_encoder = optarg;
                 break;
             case OPT_AUDIO_IGNORE_APPS:
-                options->audio_ignore_apps = optarg;
+                opts->audio_ignore_apps = optarg;
                 break;
             case OPT_AUDIO_FILTER_APPS:
-                options->audio_filter_apps = optarg;
+                opts->audio_filter_apps = optarg;
                 break;
             case OPT_FORCE_ADB_FORWARD:
                 opts->force_adb_forward = true;

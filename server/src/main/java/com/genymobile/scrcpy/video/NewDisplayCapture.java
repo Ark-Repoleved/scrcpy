@@ -351,6 +351,7 @@ public class NewDisplayCapture extends SurfaceCapture {
             startNew(surface);
         } else {
             virtualDisplay.setSurface(surface);
+            startAppMonitor(virtualDisplay.getDisplay().getDisplayId());
         }
 
         if (vdListener != null) {

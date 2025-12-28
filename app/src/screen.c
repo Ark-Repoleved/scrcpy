@@ -470,6 +470,9 @@ sc_screen_init(struct sc_screen *screen,
         sc_mouse_capture_set_active(&screen->mc, true);
     }
 
+    // Enable text input to receive IME events (for CJK input)
+    SDL_StartTextInput();
+
     return true;
 
 error_destroy_display:

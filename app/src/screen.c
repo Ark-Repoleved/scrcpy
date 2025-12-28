@@ -1,792 +1,947 @@
-#include "adb.h"
+#include "screen.h"
 
 #include <assert.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <sys/types.h>
+#include <SDL2/SDL.h>
 
-#include "adb/adb_device.h"
-#include "adb/adb_parser.h"
-#include "util/env.h"
-#include "util/file.h"
+#include "events.h"
+#include "icon.h"
+#include "options.h"
 #include "util/log.h"
-#include "util/process_intr.h"
-#include "util/str.h"
 
-/* Convenience macro to expand:
- *
- *     const char *const argv[] =
- *         SC_ADB_COMMAND("shell", "echo", "hello");
- *
- * to:
- *
- *     const char *const argv[] =
- *         { sc_adb_get_executable(), "shell", "echo", "hello", NULL };
- */
-#define SC_ADB_COMMAND(...) { sc_adb_get_executable(), __VA_ARGS__, NULL }
+#define DISPLAY_MARGINS 96
 
-static char *adb_executable;
+#define DOWNCAST(SINK) container_of(SINK, struct sc_screen, frame_sink)
 
-bool
-sc_adb_init(void) {
-    adb_executable = sc_get_env("ADB");
-    if (adb_executable) {
-        LOGD("Using adb: %s", adb_executable);
-        return true;
+static inline struct sc_size
+get_oriented_size(struct sc_size size, enum sc_orientation orientation) {
+    struct sc_size oriented_size;
+    if (sc_orientation_is_swap(orientation)) {
+        oriented_size.width = size.height;
+        oriented_size.height = size.width;
+    } else {
+        oriented_size.width = size.width;
+        oriented_size.height = size.height;
     }
+    return oriented_size;
+}
 
-#if !defined(PORTABLE) || defined(_WIN32)
-    adb_executable = strdup("adb");
-    if (!adb_executable) {
-        LOG_OOM();
+// get the window size in a struct sc_size
+static struct sc_size
+get_window_size(const struct sc_screen *screen) {
+    int width;
+    int height;
+    SDL_GetWindowSize(screen->window, &width, &height);
+
+    struct sc_size size;
+    size.width = width;
+    size.height = height;
+    return size;
+}
+
+static struct sc_point
+get_window_position(const struct sc_screen *screen) {
+    int x;
+    int y;
+    SDL_GetWindowPosition(screen->window, &x, &y);
+
+    struct sc_point point;
+    point.x = x;
+    point.y = y;
+    return point;
+}
+
+// set the window size to be applied when fullscreen is disabled
+static void
+set_window_size(struct sc_screen *screen, struct sc_size new_size) {
+    assert(!screen->fullscreen);
+    assert(!screen->maximized);
+    assert(!screen->minimized);
+    SDL_SetWindowSize(screen->window, new_size.width, new_size.height);
+}
+
+// get the preferred display bounds (i.e. the screen bounds with some margins)
+static bool
+get_preferred_display_bounds(struct sc_size *bounds) {
+    SDL_Rect rect;
+    if (SDL_GetDisplayUsableBounds(0, &rect)) {
+        LOGW("Could not get display usable bounds: %s", SDL_GetError());
         return false;
     }
-#else
-    // For portable builds, use the absolute path to the adb executable
-    // in the same directory as scrcpy (except on Windows, where "adb"
-    // is sufficient)
-    adb_executable = sc_file_get_local_path("adb");
-    if (!adb_executable) {
-        // Error already logged
-        return false;
-    }
 
-    LOGD("Using adb (portable): %s", adb_executable);
-#endif
-
+    bounds->width = MAX(0, rect.w - DISPLAY_MARGINS);
+    bounds->height = MAX(0, rect.h - DISPLAY_MARGINS);
     return true;
 }
 
-void
-sc_adb_destroy(void) {
-    free(adb_executable);
+static bool
+is_optimal_size(struct sc_size current_size, struct sc_size content_size) {
+    // The size is optimal if we can recompute one dimension of the current
+    // size from the other
+    return current_size.height == current_size.width * content_size.height
+                                                     / content_size.width
+        || current_size.width == current_size.height * content_size.width
+                                                     / content_size.height;
 }
 
-const char *
-sc_adb_get_executable(void) {
-    return adb_executable;
+// return the optimal size of the window, with the following constraints:
+//  - it attempts to keep at least one dimension of the current_size (i.e. it
+//    crops the black borders)
+//  - it keeps the aspect ratio
+//  - it scales down to make it fit in the display_size
+static struct sc_size
+get_optimal_size(struct sc_size current_size, struct sc_size content_size,
+                 bool within_display_bounds) {
+    if (content_size.width == 0 || content_size.height == 0) {
+        // avoid division by 0
+        return current_size;
+    }
+
+    struct sc_size window_size;
+
+    struct sc_size display_size;
+    if (!within_display_bounds ||
+            !get_preferred_display_bounds(&display_size)) {
+        // do not constraint the size
+        window_size = current_size;
+    } else {
+        window_size.width = MIN(current_size.width, display_size.width);
+        window_size.height = MIN(current_size.height, display_size.height);
+    }
+
+    if (is_optimal_size(window_size, content_size)) {
+        return window_size;
+    }
+
+    bool keep_width = content_size.width * window_size.height
+                    > content_size.height * window_size.width;
+    if (keep_width) {
+        // remove black borders on top and bottom
+        window_size.height = content_size.height * window_size.width
+                           / content_size.width;
+    } else {
+        // remove black borders on left and right (or none at all if it already
+        // fits)
+        window_size.width = content_size.width * window_size.height
+                          / content_size.height;
+    }
+
+    return window_size;
 }
 
-// serialize argv to string "[arg1], [arg2], [arg3]"
-static size_t
-argv_to_string(const char *const *argv, char *buf, size_t bufsize) {
-    size_t idx = 0;
-    bool first = true;
-    while (*argv) {
-        const char *arg = *argv;
-        size_t len = strlen(arg);
-        // count space for "[], ...\0"
-        if (idx + len + 8 >= bufsize) {
-            // not enough space, truncate
-            assert(idx < bufsize - 4);
-            memcpy(&buf[idx], "...", 3);
-            idx += 3;
-            break;
-        }
-        if (first) {
-            first = false;
+// initially, there is no current size, so use the frame size as current size
+// req_width and req_height, if not 0, are the sizes requested by the user
+static inline struct sc_size
+get_initial_optimal_size(struct sc_size content_size, uint16_t req_width,
+                         uint16_t req_height) {
+    struct sc_size window_size;
+    if (!req_width && !req_height) {
+        window_size = get_optimal_size(content_size, content_size, true);
+    } else {
+        if (req_width) {
+            window_size.width = req_width;
         } else {
-            buf[idx++] = ',';
-            buf[idx++] = ' ';
+            // compute from the requested height
+            window_size.width = (uint32_t) req_height * content_size.width
+                              / content_size.height;
         }
-        buf[idx++] = '[';
-        memcpy(&buf[idx], arg, len);
-        idx += len;
-        buf[idx++] = ']';
-        argv++;
+        if (req_height) {
+            window_size.height = req_height;
+        } else {
+            // compute from the requested width
+            window_size.height = (uint32_t) req_width * content_size.height
+                               / content_size.width;
+        }
     }
-    assert(idx < bufsize);
-    buf[idx] = '\0';
-    return idx;
+    return window_size;
+}
+
+static inline bool
+sc_screen_is_relative_mode(struct sc_screen *screen) {
+    // screen->im.mp may be NULL if --no-control
+    return screen->im.mp && screen->im.mp->relative_mode;
 }
 
 static void
-show_adb_installation_msg(void) {
-#ifndef _WIN32
-    static const struct {
-        const char *binary;
-        const char *command;
-    } pkg_managers[] = {
-        {"apt", "apt install adb"},
-        {"apt-get", "apt-get install adb"},
-        {"brew", "brew install --cask android-platform-tools"},
-        {"dnf", "dnf install android-tools"},
-        {"emerge", "emerge dev-util/android-tools"},
-        {"pacman", "pacman -S android-tools"},
-    };
-    for (size_t i = 0; i < ARRAY_LEN(pkg_managers); ++i) {
-        if (sc_file_executable_exists(pkg_managers[i].binary)) {
-            LOGI("You may install 'adb' by \"%s\"", pkg_managers[i].command);
-            return;
-        }
-    }
-#endif
-}
+sc_screen_update_content_rect(struct sc_screen *screen) {
+    assert(screen->video);
 
-static void
-show_adb_err_msg(enum sc_process_result err, const char *const argv[]) {
-#define MAX_COMMAND_STRING_LEN 1024
-    char *buf = malloc(MAX_COMMAND_STRING_LEN);
-    if (!buf) {
-        LOG_OOM();
-        LOGE("Failed to execute");
+    int dw;
+    int dh;
+    SDL_GL_GetDrawableSize(screen->window, &dw, &dh);
+
+    struct sc_size content_size = screen->content_size;
+    // The drawable size is the window size * the HiDPI scale
+    struct sc_size drawable_size = {dw, dh};
+
+    SDL_Rect *rect = &screen->rect;
+
+    if (is_optimal_size(drawable_size, content_size)) {
+        rect->x = 0;
+        rect->y = 0;
+        rect->w = drawable_size.width;
+        rect->h = drawable_size.height;
         return;
     }
 
-    switch (err) {
-        case SC_PROCESS_ERROR_GENERIC:
-            argv_to_string(argv, buf, MAX_COMMAND_STRING_LEN);
-            LOGE("Failed to execute: %s", buf);
-            break;
-        case SC_PROCESS_ERROR_MISSING_BINARY:
-            argv_to_string(argv, buf, MAX_COMMAND_STRING_LEN);
-            LOGE("Command not found: %s", buf);
-            LOGE("(make 'adb' accessible from your PATH or define its full"
-                 "path in the ADB environment variable)");
-            show_adb_installation_msg();
-            break;
-        case SC_PROCESS_SUCCESS:
-            // do nothing
-            break;
+    bool keep_width = content_size.width * drawable_size.height
+                    > content_size.height * drawable_size.width;
+    if (keep_width) {
+        rect->x = 0;
+        rect->w = drawable_size.width;
+        rect->h = drawable_size.width * content_size.height
+                                      / content_size.width;
+        rect->y = (drawable_size.height - rect->h) / 2;
+    } else {
+        rect->y = 0;
+        rect->h = drawable_size.height;
+        rect->w = drawable_size.height * content_size.width
+                                       / content_size.height;
+        rect->x = (drawable_size.width - rect->w) / 2;
     }
-
-    free(buf);
 }
 
-static bool
-process_check_success_internal(sc_pid pid, const char *name, bool close,
-                               unsigned flags) {
-    bool log_errors = !(flags & SC_ADB_NO_LOGERR);
+// render the texture to the renderer
+//
+// Set the update_content_rect flag if the window or content size may have
+// changed, so that the content rectangle is recomputed
+static void
+sc_screen_render(struct sc_screen *screen, bool update_content_rect) {
+    assert(screen->video);
 
-    if (pid == SC_PROCESS_NONE) {
-        if (log_errors) {
-            LOGE("Could not execute \"%s\"", name);
-        }
-        return false;
-    }
-    sc_exit_code exit_code = sc_process_wait(pid, close);
-    if (exit_code) {
-        if (log_errors) {
-            if (exit_code != SC_EXIT_CODE_NONE) {
-                LOGE("\"%s\" returned with value %" SC_PRIexitcode, name,
-                     exit_code);
-            } else {
-                LOGE("\"%s\" exited unexpectedly", name);
-            }
-        }
-        return false;
-    }
-    return true;
-}
-
-static bool
-process_check_success_intr(struct sc_intr *intr, sc_pid pid, const char *name,
-                           unsigned flags) {
-    if (intr && !sc_intr_set_process(intr, pid)) {
-        // Already interrupted
-        return false;
+    if (update_content_rect) {
+        sc_screen_update_content_rect(screen);
     }
 
-    // Always pass close=false, interrupting would be racy otherwise
-    bool ret = process_check_success_internal(pid, name, false, flags);
-
-    if (intr) {
-        sc_intr_set_process(intr, SC_PROCESS_NONE);
-    }
-
-    // Close separately
-    sc_process_close(pid);
-
-    return ret;
-}
-
-static sc_pid
-sc_adb_execute_p(const char *const argv[], unsigned flags, sc_pipe *pout) {
-    unsigned process_flags = 0;
-    if (flags & SC_ADB_NO_STDOUT) {
-        process_flags |= SC_PROCESS_NO_STDOUT;
-    }
-    if (flags & SC_ADB_NO_STDERR) {
-        process_flags |= SC_PROCESS_NO_STDERR;
-    }
-
-    sc_pid pid;
-    enum sc_process_result r =
-        sc_process_execute_p(argv, &pid, process_flags, NULL, pout, NULL);
-    if (r != SC_PROCESS_SUCCESS) {
-        // If the execution itself failed (not the command exit code), log the
-        // error in all cases
-        show_adb_err_msg(r, argv);
-        pid = SC_PROCESS_NONE;
-    }
-
-    return pid;
-}
-
-sc_pid
-sc_adb_execute(const char *const argv[], unsigned flags) {
-    return sc_adb_execute_p(argv, flags, NULL);
-}
-
-bool
-sc_adb_start_server(struct sc_intr *intr, unsigned flags) {
-    const char *const argv[] = SC_ADB_COMMAND("start-server");
-
-    sc_pid pid = sc_adb_execute(argv, flags);
-    return process_check_success_intr(intr, pid, "adb start-server", flags);
-}
-
-bool
-sc_adb_kill_server(struct sc_intr *intr, unsigned flags) {
-    const char *const argv[] = SC_ADB_COMMAND("kill-server");
-
-    sc_pid pid = sc_adb_execute(argv, flags);
-    return process_check_success_intr(intr, pid, "adb kill-server", flags);
-}
-
-bool
-sc_adb_forward(struct sc_intr *intr, const char *serial, uint16_t local_port,
-               const char *device_socket_name, unsigned flags) {
-    char local[4 + 5 + 1]; // tcp:PORT
-    char remote[108 + 14 + 1]; // localabstract:NAME
-
-    int r = snprintf(local, sizeof(local), "tcp:%" PRIu16, local_port);
-    assert(r >= 0 && (size_t) r < sizeof(local));
-
-    r = snprintf(remote, sizeof(remote), "localabstract:%s",
-                 device_socket_name);
-    if (r < 0 || (size_t) r >= sizeof(remote)) {
-        LOGE("Could not write socket name");
-        return false;
-    }
-
-    assert(serial);
-    const char *const argv[] =
-        SC_ADB_COMMAND("-s", serial, "forward", local, remote);
-
-    sc_pid pid = sc_adb_execute(argv, flags);
-    return process_check_success_intr(intr, pid, "adb forward", flags);
-}
-
-bool
-sc_adb_forward_remove(struct sc_intr *intr, const char *serial,
-                      uint16_t local_port, unsigned flags) {
-    char local[4 + 5 + 1]; // tcp:PORT
-    int r = snprintf(local, sizeof(local), "tcp:%" PRIu16, local_port);
-    assert(r >= 0 && (size_t) r < sizeof(local));
-    (void) r;
-
-    assert(serial);
-    const char *const argv[] =
-        SC_ADB_COMMAND("-s", serial, "forward", "--remove", local);
-
-    sc_pid pid = sc_adb_execute(argv, flags);
-    return process_check_success_intr(intr, pid, "adb forward --remove", flags);
-}
-
-bool
-sc_adb_reverse(struct sc_intr *intr, const char *serial,
-               const char *device_socket_name, uint16_t local_port,
-               unsigned flags) {
-    char local[4 + 5 + 1]; // tcp:PORT
-    char remote[108 + 14 + 1]; // localabstract:NAME
-    int r = snprintf(local, sizeof(local), "tcp:%" PRIu16, local_port);
-    assert(r >= 0 && (size_t) r < sizeof(local));
-
-    r = snprintf(remote, sizeof(remote), "localabstract:%s",
-                 device_socket_name);
-    if (r < 0 || (size_t) r >= sizeof(remote)) {
-        LOGE("Could not write socket name");
-        return false;
-    }
-
-    assert(serial);
-    const char *const argv[] =
-        SC_ADB_COMMAND("-s", serial, "reverse", remote, local);
-
-    sc_pid pid = sc_adb_execute(argv, flags);
-    return process_check_success_intr(intr, pid, "adb reverse", flags);
-}
-
-bool
-sc_adb_reverse_remove(struct sc_intr *intr, const char *serial,
-                      const char *device_socket_name, unsigned flags) {
-    char remote[108 + 14 + 1]; // localabstract:NAME
-    int r = snprintf(remote, sizeof(remote), "localabstract:%s",
-                     device_socket_name);
-    if (r < 0 || (size_t) r >= sizeof(remote)) {
-        LOGE("Device socket name too long");
-        return false;
-    }
-
-    assert(serial);
-    const char *const argv[] =
-        SC_ADB_COMMAND("-s", serial, "reverse", "--remove", remote);
-
-    sc_pid pid = sc_adb_execute(argv, flags);
-    return process_check_success_intr(intr, pid, "adb reverse --remove", flags);
-}
-
-bool
-sc_adb_push(struct sc_intr *intr, const char *serial, const char *local,
-            const char *remote, unsigned flags) {
-#ifdef _WIN32
-    // Windows will parse the string, so the paths must be quoted
-    // (see sys/win/command.c)
-    local = sc_str_quote(local);
-    if (!local) {
-        return SC_PROCESS_NONE;
-    }
-    remote = sc_str_quote(remote);
-    if (!remote) {
-        free((void *) local);
-        return SC_PROCESS_NONE;
-    }
-#endif
-
-    assert(serial);
-    const char *const argv[] =
-        SC_ADB_COMMAND("-s", serial, "push", local, remote);
-
-    sc_pid pid = sc_adb_execute(argv, flags);
-
-#ifdef _WIN32
-    free((void *) remote);
-    free((void *) local);
-#endif
-
-    return process_check_success_intr(intr, pid, "adb push", flags);
-}
-
-bool
-sc_adb_install(struct sc_intr *intr, const char *serial, const char *local,
-               unsigned flags) {
-#ifdef _WIN32
-    // Windows will parse the string, so the local name must be quoted
-    // (see sys/win/command.c)
-    local = sc_str_quote(local);
-    if (!local) {
-        return SC_PROCESS_NONE;
-    }
-#endif
-
-    assert(serial);
-    const char *const argv[] =
-        SC_ADB_COMMAND("-s", serial, "install", "-r", local);
-
-    sc_pid pid = sc_adb_execute(argv, flags);
-
-#ifdef _WIN32
-    free((void *) local);
-#endif
-
-    return process_check_success_intr(intr, pid, "adb install", flags);
-}
-
-bool
-sc_adb_tcpip(struct sc_intr *intr, const char *serial, uint16_t port,
-             unsigned flags) {
-    char port_string[5 + 1];
-    int r = snprintf(port_string, sizeof(port_string), "%" PRIu16, port);
-    assert(r >= 0 && (size_t) r < sizeof(port_string));
-    (void) r;
-
-    assert(serial);
-    const char *const argv[] =
-        SC_ADB_COMMAND("-s", serial, "tcpip", port_string);
-
-    sc_pid pid = sc_adb_execute(argv, flags);
-    return process_check_success_intr(intr, pid, "adb tcpip", flags);
-}
-
-bool
-sc_adb_connect(struct sc_intr *intr, const char *ip_port, unsigned flags) {
-    const char *const argv[] = SC_ADB_COMMAND("connect", ip_port);
-
-    sc_pipe pout;
-    sc_pid pid = sc_adb_execute_p(argv, flags, &pout);
-    if (pid == SC_PROCESS_NONE) {
-        LOGE("Could not execute \"adb connect\"");
-        return false;
-    }
-
-    // "adb connect" always returns successfully (with exit code 0), even in
-    // case of failure. As a workaround, check if its output starts with
-    // "connected" or "already connected".
-    char buf[128];
-    ssize_t r = sc_pipe_read_all_intr(intr, pid, pout, buf, sizeof(buf) - 1);
-    sc_pipe_close(pout);
-
-    bool ok = process_check_success_intr(intr, pid, "adb connect", flags);
-    if (!ok) {
-        return false;
-    }
-
-    if (r == -1) {
-        return false;
-    }
-
-    assert((size_t) r < sizeof(buf));
-    buf[r] = '\0';
-
-    ok = !strncmp("connected", buf, sizeof("connected") - 1)
-        || !strncmp("already connected", buf, sizeof("already connected") - 1);
-    if (!ok && !(flags & SC_ADB_NO_STDERR)) {
-        // "adb connect" also prints errors to stdout. Since we capture it,
-        // re-print the error to stderr.
-        size_t len = strcspn(buf, "\r\n");
-        buf[len] = '\0';
-        fprintf(stderr, "%s\n", buf);
-    }
-    return ok;
-}
-
-bool
-sc_adb_disconnect(struct sc_intr *intr, const char *ip_port, unsigned flags) {
-    assert(ip_port);
-    const char *const argv[] = SC_ADB_COMMAND("disconnect", ip_port);
-
-    sc_pid pid = sc_adb_execute(argv, flags);
-    return process_check_success_intr(intr, pid, "adb disconnect", flags);
-}
-
-static bool
-sc_adb_list_devices(struct sc_intr *intr, unsigned flags,
-                    struct sc_vec_adb_devices *out_vec) {
-    const char *const argv[] = SC_ADB_COMMAND("devices", "-l");
-
-#define BUFSIZE 65536
-    char *buf = malloc(BUFSIZE);
-    if (!buf) {
-        LOG_OOM();
-        return false;
-    }
-
-    sc_pipe pout;
-    sc_pid pid = sc_adb_execute_p(argv, flags, &pout);
-    if (pid == SC_PROCESS_NONE) {
-        LOGE("Could not execute \"adb devices -l\"");
-        free(buf);
-        return false;
-    }
-
-    ssize_t r = sc_pipe_read_all_intr(intr, pid, pout, buf, BUFSIZE - 1);
-    sc_pipe_close(pout);
-
-    bool ok = process_check_success_intr(intr, pid, "adb devices -l", flags);
-    if (!ok) {
-        free(buf);
-        return false;
-    }
-
-    if (r == -1) {
-        free(buf);
-        return false;
-    }
-
-    assert((size_t) r < BUFSIZE);
-    if (r == BUFSIZE - 1)  {
-        // The implementation assumes that the output of "adb devices -l" fits
-        // in the buffer in a single pass
-        LOGW("Result of \"adb devices -l\" does not fit in 64Kb. "
-             "Please report an issue.");
-        free(buf);
-        return false;
-    }
-
-    // It is parsed as a NUL-terminated string
-    buf[r] = '\0';
-
-    // List all devices to the output list directly
-    ok = sc_adb_parse_devices(buf, out_vec);
-    free(buf);
-    return ok;
-}
-
-static bool
-sc_adb_accept_device(const struct sc_adb_device *device,
-                     const struct sc_adb_device_selector *selector) {
-    switch (selector->type) {
-        case SC_ADB_DEVICE_SELECT_ALL:
-            return true;
-        case SC_ADB_DEVICE_SELECT_SERIAL:
-            assert(selector->serial);
-            char *device_serial_colon = strchr(device->serial, ':');
-            if (device_serial_colon) {
-                // The device serial is an IP:port...
-                char *serial_colon = strchr(selector->serial, ':');
-                if (!serial_colon) {
-                    // But the requested serial has no ':', so only consider
-                    // the IP part of the device serial. This allows to use
-                    // "192.168.1.1" to match any "192.168.1.1:port".
-                    size_t serial_len = strlen(selector->serial);
-                    size_t device_ip_len = device_serial_colon - device->serial;
-                    if (serial_len != device_ip_len) {
-                        // They are not equal, they don't even have the same
-                        // length
-                        return false;
-                    }
-                    return !strncmp(selector->serial, device->serial,
-                                    device_ip_len);
-                }
-            }
-            return !strcmp(selector->serial, device->serial);
-        case SC_ADB_DEVICE_SELECT_USB:
-            return sc_adb_device_get_type(device->serial) ==
-                    SC_ADB_DEVICE_TYPE_USB;
-        case SC_ADB_DEVICE_SELECT_TCPIP:
-            // Both emulators and TCP/IP devices are selected via -e
-            return sc_adb_device_get_type(device->serial) !=
-                    SC_ADB_DEVICE_TYPE_USB;
-        default:
-            assert(!"Missing SC_ADB_DEVICE_SELECT_* handling");
-            break;
-    }
-
-    return false;
-}
-
-static size_t
-sc_adb_devices_select(struct sc_adb_device *devices, size_t len,
-                      const struct sc_adb_device_selector *selector,
-                      size_t *idx_out) {
-    size_t count = 0;
-    for (size_t i = 0; i < len; ++i) {
-        struct sc_adb_device *device = &devices[i];
-        device->selected = sc_adb_accept_device(device, selector);
-        if (device->selected) {
-            if (idx_out && !count) {
-                *idx_out = i;
-            }
-            ++count;
-        }
-    }
-
-    return count;
+    enum sc_display_result res =
+        sc_display_render(&screen->display, &screen->rect, screen->orientation);
+    (void) res; // any error already logged
 }
 
 static void
-sc_adb_devices_log(enum sc_log_level level, struct sc_adb_device *devices,
-                   size_t count) {
-    for (size_t i = 0; i < count; ++i) {
-        struct sc_adb_device *d = &devices[i];
-        const char *selection = d->selected ? "-->" : "   ";
-        bool is_usb =
-            sc_adb_device_get_type(d->serial) == SC_ADB_DEVICE_TYPE_USB;
-        const char *type = is_usb ? "  (usb)"
-                                  : "(tcpip)";
-        LOG(level, "    %s %s  %-20s  %16s  %s",
-             selection, type, d->serial, d->state, d->model ? d->model : "");
+sc_screen_render_novideo(struct sc_screen *screen) {
+    enum sc_display_result res =
+        sc_display_render(&screen->display, NULL, SC_ORIENTATION_0);
+    (void) res; // any error already logged
+}
+
+#if defined(__APPLE__) || defined(_WIN32)
+# define CONTINUOUS_RESIZING_WORKAROUND
+#endif
+
+#ifdef CONTINUOUS_RESIZING_WORKAROUND
+// On Windows and MacOS, resizing blocks the event loop, so resizing events are
+// not triggered. As a workaround, handle them in an event handler.
+//
+// <https://bugzilla.libsdl.org/show_bug.cgi?id=2077>
+// <https://stackoverflow.com/a/40693139/1987178>
+static int
+event_watcher(void *data, SDL_Event *event) {
+    struct sc_screen *screen = data;
+    assert(screen->video);
+
+    if (event->type == SDL_WINDOWEVENT
+            && event->window.event == SDL_WINDOWEVENT_RESIZED) {
+        // In practice, it seems to always be called from the same thread in
+        // that specific case. Anyway, it's just a workaround.
+        sc_screen_render(screen, true);
     }
+    return 0;
+}
+#endif
+
+static bool
+sc_screen_frame_sink_open(struct sc_frame_sink *sink,
+                          const AVCodecContext *ctx) {
+    assert(ctx->pix_fmt == AV_PIX_FMT_YUV420P);
+    (void) ctx;
+
+    struct sc_screen *screen = DOWNCAST(sink);
+
+    if (ctx->width <= 0 || ctx->width > 0xFFFF
+            || ctx->height <= 0 || ctx->height > 0xFFFF) {
+        LOGE("Invalid video size: %dx%d", ctx->width, ctx->height);
+        return false;
+    }
+
+    assert(ctx->width > 0 && ctx->width <= 0xFFFF);
+    assert(ctx->height > 0 && ctx->height <= 0xFFFF);
+    // screen->frame_size is never used before the event is pushed, and the
+    // event acts as a memory barrier so it is safe without mutex
+    screen->frame_size.width = ctx->width;
+    screen->frame_size.height = ctx->height;
+
+    // Post the event on the UI thread (the texture must be created from there)
+    bool ok = sc_push_event(SC_EVENT_SCREEN_INIT_SIZE);
+    if (!ok) {
+        return false;
+    }
+
+#ifndef NDEBUG
+    screen->open = true;
+#endif
+
+    // nothing to do, the screen is already open on the main thread
+    return true;
+}
+
+static void
+sc_screen_frame_sink_close(struct sc_frame_sink *sink) {
+    struct sc_screen *screen = DOWNCAST(sink);
+    (void) screen;
+#ifndef NDEBUG
+    screen->open = false;
+#endif
+
+    // nothing to do, the screen lifecycle is not managed by the frame producer
 }
 
 static bool
-sc_adb_device_check_state(struct sc_adb_device *device,
-                          struct sc_adb_device *devices, size_t count) {
-    const char *state = device->state;
+sc_screen_frame_sink_push(struct sc_frame_sink *sink, const AVFrame *frame) {
+    struct sc_screen *screen = DOWNCAST(sink);
+    assert(screen->video);
 
-    if (!strcmp("device", state)) {
-        return true;
+    bool previous_skipped;
+    bool ok = sc_frame_buffer_push(&screen->fb, frame, &previous_skipped);
+    if (!ok) {
+        return false;
     }
 
-    if (!strcmp("unauthorized", state)) {
-        LOGE("Device is unauthorized:");
-        sc_adb_devices_log(SC_LOG_LEVEL_ERROR, devices, count);
-        LOGE("A popup should open on the device to request authorization.");
-        LOGE("Check the FAQ: "
-             "<https://github.com/Genymobile/scrcpy/blob/master/FAQ.md>");
+    if (previous_skipped) {
+        sc_fps_counter_add_skipped_frame(&screen->fps_counter);
+        // The SC_EVENT_NEW_FRAME triggered for the previous frame will consume
+        // this new frame instead
     } else {
-        LOGE("Device could not be connected (state=%s)", state);
+        // Post the event on the UI thread
+        bool ok = sc_push_event(SC_EVENT_NEW_FRAME);
+        if (!ok) {
+            return false;
+        }
     }
+
+    return true;
+}
+
+bool
+sc_screen_init(struct sc_screen *screen,
+               const struct sc_screen_params *params) {
+    screen->resize_pending = false;
+    screen->has_frame = false;
+    screen->fullscreen = false;
+    screen->maximized = false;
+    screen->minimized = false;
+    screen->paused = false;
+    screen->resume_frame = NULL;
+    screen->orientation = SC_ORIENTATION_0;
+
+    screen->video = params->video;
+
+    screen->req.x = params->window_x;
+    screen->req.y = params->window_y;
+    screen->req.width = params->window_width;
+    screen->req.height = params->window_height;
+    screen->req.fullscreen = params->fullscreen;
+    screen->req.start_fps_counter = params->start_fps_counter;
+
+    bool ok = sc_frame_buffer_init(&screen->fb);
+    if (!ok) {
+        return false;
+    }
+
+    if (!sc_fps_counter_init(&screen->fps_counter)) {
+        goto error_destroy_frame_buffer;
+    }
+
+    if (screen->video) {
+        screen->orientation = params->orientation;
+        if (screen->orientation != SC_ORIENTATION_0) {
+            LOGI("Initial display orientation set to %s",
+                 sc_orientation_get_name(screen->orientation));
+        }
+    }
+
+    uint32_t window_flags = SDL_WINDOW_ALLOW_HIGHDPI;
+    if (params->always_on_top) {
+        window_flags |= SDL_WINDOW_ALWAYS_ON_TOP;
+    }
+    if (params->window_borderless) {
+        window_flags |= SDL_WINDOW_BORDERLESS;
+    }
+    if (params->video) {
+        // The window will be shown on first frame
+        window_flags |= SDL_WINDOW_HIDDEN
+                      | SDL_WINDOW_RESIZABLE;
+    }
+
+    const char *title = params->window_title;
+    assert(title);
+
+    int x = SDL_WINDOWPOS_UNDEFINED;
+    int y = SDL_WINDOWPOS_UNDEFINED;
+    int width = 256;
+    int height = 256;
+    if (params->window_x != SC_WINDOW_POSITION_UNDEFINED) {
+        x = params->window_x;
+    }
+    if (params->window_y != SC_WINDOW_POSITION_UNDEFINED) {
+        y = params->window_y;
+    }
+    if (params->window_width) {
+        width = params->window_width;
+    }
+    if (params->window_height) {
+        height = params->window_height;
+    }
+
+    // The window will be positioned and sized on first video frame
+    screen->window = SDL_CreateWindow(title, x, y, width, height, window_flags);
+    if (!screen->window) {
+        LOGE("Could not create window: %s", SDL_GetError());
+        goto error_destroy_fps_counter;
+    }
+
+    SDL_Surface *icon = scrcpy_icon_load();
+    if (icon) {
+        SDL_SetWindowIcon(screen->window, icon);
+    } else if (params->video) {
+        // just a warning
+        LOGW("Could not load icon");
+    } else {
+        // without video, the icon is used as window content, it must be present
+        LOGE("Could not load icon");
+        goto error_destroy_window;
+    }
+
+    SDL_Surface *icon_novideo = params->video ? NULL : icon;
+    bool mipmaps = params->video && params->mipmaps;
+    ok = sc_display_init(&screen->display, screen->window, icon_novideo,
+                         mipmaps);
+    if (icon) {
+        scrcpy_icon_destroy(icon);
+    }
+    if (!ok) {
+        goto error_destroy_window;
+    }
+
+    screen->frame = av_frame_alloc();
+    if (!screen->frame) {
+        LOG_OOM();
+        goto error_destroy_display;
+    }
+
+    struct sc_input_manager_params im_params = {
+        .controller = params->controller,
+        .fp = params->fp,
+        .screen = screen,
+        .kp = params->kp,
+        .mp = params->mp,
+        .gp = params->gp,
+        .mouse_bindings = params->mouse_bindings,
+        .legacy_paste = params->legacy_paste,
+        .clipboard_autosync = params->clipboard_autosync,
+        .shortcut_mods = params->shortcut_mods,
+    };
+
+    sc_input_manager_init(&screen->im, &im_params);
+
+    // Initialize even if not used for simplicity
+    sc_mouse_capture_init(&screen->mc, screen->window, params->shortcut_mods);
+
+#ifdef CONTINUOUS_RESIZING_WORKAROUND
+    if (screen->video) {
+        SDL_AddEventWatch(event_watcher, screen);
+    }
+#endif
+
+    static const struct sc_frame_sink_ops ops = {
+        .open = sc_screen_frame_sink_open,
+        .close = sc_screen_frame_sink_close,
+        .push = sc_screen_frame_sink_push,
+    };
+
+    screen->frame_sink.ops = &ops;
+
+#ifndef NDEBUG
+    screen->open = false;
+#endif
+
+    if (!screen->video && sc_screen_is_relative_mode(screen)) {
+        // Capture mouse immediately if video mirroring is disabled
+        sc_mouse_capture_set_active(&screen->mc, true);
+    }
+
+    return true;
+
+error_destroy_display:
+    sc_display_destroy(&screen->display);
+error_destroy_window:
+    SDL_DestroyWindow(screen->window);
+error_destroy_fps_counter:
+    sc_fps_counter_destroy(&screen->fps_counter);
+error_destroy_frame_buffer:
+    sc_frame_buffer_destroy(&screen->fb);
 
     return false;
 }
 
-bool
-sc_adb_select_device(struct sc_intr *intr,
-                     const struct sc_adb_device_selector *selector,
-                     unsigned flags, struct sc_adb_device *out_device) {
-    struct sc_vec_adb_devices vec = SC_VECTOR_INITIALIZER;
-    bool ok = sc_adb_list_devices(intr, flags, &vec);
-    if (!ok) {
-        LOGE("Could not list ADB devices");
-        return false;
+static void
+sc_screen_show_initial_window(struct sc_screen *screen) {
+    int x = screen->req.x != SC_WINDOW_POSITION_UNDEFINED
+          ? screen->req.x : (int) SDL_WINDOWPOS_CENTERED;
+    int y = screen->req.y != SC_WINDOW_POSITION_UNDEFINED
+          ? screen->req.y : (int) SDL_WINDOWPOS_CENTERED;
+
+    struct sc_size window_size =
+        get_initial_optimal_size(screen->content_size, screen->req.width,
+                                                       screen->req.height);
+
+    set_window_size(screen, window_size);
+    SDL_SetWindowPosition(screen->window, x, y);
+
+    if (screen->req.fullscreen) {
+        sc_screen_toggle_fullscreen(screen);
     }
 
-    if (vec.size == 0) {
-        LOGE("Could not find any ADB device");
-        return false;
+    if (screen->req.start_fps_counter) {
+        sc_fps_counter_start(&screen->fps_counter);
     }
 
-    size_t sel_idx; // index of the single matching device if sel_count == 1
-    size_t sel_count =
-        sc_adb_devices_select(vec.data, vec.size, selector, &sel_idx);
+    SDL_ShowWindow(screen->window);
+    sc_screen_update_content_rect(screen);
+}
 
-    if (sel_count == 0) {
-        // if count > 0 && sel_count == 0, then necessarily a selection is
-        // requested
-        assert(selector->type != SC_ADB_DEVICE_SELECT_ALL);
+void
+sc_screen_hide_window(struct sc_screen *screen) {
+    SDL_HideWindow(screen->window);
+}
 
-        switch (selector->type) {
-            case SC_ADB_DEVICE_SELECT_SERIAL:
-                assert(selector->serial);
-                LOGE("Could not find ADB device %s:", selector->serial);
-                break;
-            case SC_ADB_DEVICE_SELECT_USB:
-                LOGE("Could not find any ADB device over USB:");
-                break;
-            case SC_ADB_DEVICE_SELECT_TCPIP:
-                LOGE("Could not find any ADB device over TCP/IP:");
-                break;
-            default:
-                assert(!"Unexpected selector type");
-                break;
+void
+sc_screen_interrupt(struct sc_screen *screen) {
+    sc_fps_counter_interrupt(&screen->fps_counter);
+}
+
+void
+sc_screen_join(struct sc_screen *screen) {
+    sc_fps_counter_join(&screen->fps_counter);
+}
+
+void
+sc_screen_destroy(struct sc_screen *screen) {
+#ifndef NDEBUG
+    assert(!screen->open);
+#endif
+    sc_display_destroy(&screen->display);
+    av_frame_free(&screen->frame);
+    SDL_DestroyWindow(screen->window);
+    sc_fps_counter_destroy(&screen->fps_counter);
+    sc_frame_buffer_destroy(&screen->fb);
+}
+
+static void
+resize_for_content(struct sc_screen *screen, struct sc_size old_content_size,
+                   struct sc_size new_content_size) {
+    assert(screen->video);
+
+    struct sc_size window_size = get_window_size(screen);
+    struct sc_size target_size = {
+        .width = (uint32_t) window_size.width * new_content_size.width
+                / old_content_size.width,
+        .height = (uint32_t) window_size.height * new_content_size.height
+                / old_content_size.height,
+    };
+    target_size = get_optimal_size(target_size, new_content_size, true);
+    set_window_size(screen, target_size);
+}
+
+static void
+set_content_size(struct sc_screen *screen, struct sc_size new_content_size) {
+    assert(screen->video);
+
+    if (!screen->fullscreen && !screen->maximized && !screen->minimized) {
+        resize_for_content(screen, screen->content_size, new_content_size);
+    } else if (!screen->resize_pending) {
+        // Store the windowed size to be able to compute the optimal size once
+        // fullscreen/maximized/minimized are disabled
+        screen->windowed_content_size = screen->content_size;
+        screen->resize_pending = true;
+    }
+
+    screen->content_size = new_content_size;
+}
+
+static void
+apply_pending_resize(struct sc_screen *screen) {
+    assert(screen->video);
+
+    assert(!screen->fullscreen);
+    assert(!screen->maximized);
+    assert(!screen->minimized);
+    if (screen->resize_pending) {
+        resize_for_content(screen, screen->windowed_content_size,
+                                   screen->content_size);
+        screen->resize_pending = false;
+    }
+}
+
+void
+sc_screen_set_orientation(struct sc_screen *screen,
+                          enum sc_orientation orientation) {
+    assert(screen->video);
+
+    if (orientation == screen->orientation) {
+        return;
+    }
+
+    struct sc_size new_content_size =
+        get_oriented_size(screen->frame_size, orientation);
+
+    set_content_size(screen, new_content_size);
+
+    screen->orientation = orientation;
+    LOGI("Display orientation set to %s", sc_orientation_get_name(orientation));
+
+    sc_screen_render(screen, true);
+}
+
+static bool
+sc_screen_init_size(struct sc_screen *screen) {
+    // Before first frame
+    assert(!screen->has_frame);
+
+    // The requested size is passed via screen->frame_size
+
+    struct sc_size content_size =
+        get_oriented_size(screen->frame_size, screen->orientation);
+    screen->content_size = content_size;
+
+    enum sc_display_result res =
+        sc_display_set_texture_size(&screen->display, screen->frame_size);
+    return res != SC_DISPLAY_RESULT_ERROR;
+}
+
+// recreate the texture and resize the window if the frame size has changed
+static enum sc_display_result
+prepare_for_frame(struct sc_screen *screen, struct sc_size new_frame_size) {
+    assert(screen->video);
+
+    if (screen->frame_size.width == new_frame_size.width
+            && screen->frame_size.height == new_frame_size.height) {
+        return SC_DISPLAY_RESULT_OK;
+    }
+
+    // frame dimension changed
+    screen->frame_size = new_frame_size;
+
+    struct sc_size new_content_size =
+        get_oriented_size(new_frame_size, screen->orientation);
+    set_content_size(screen, new_content_size);
+
+    sc_screen_update_content_rect(screen);
+
+    return sc_display_set_texture_size(&screen->display, screen->frame_size);
+}
+
+static bool
+sc_screen_apply_frame(struct sc_screen *screen) {
+    assert(screen->video);
+
+    sc_fps_counter_add_rendered_frame(&screen->fps_counter);
+
+    AVFrame *frame = screen->frame;
+    struct sc_size new_frame_size = {frame->width, frame->height};
+    enum sc_display_result res = prepare_for_frame(screen, new_frame_size);
+    if (res == SC_DISPLAY_RESULT_ERROR) {
+        return false;
+    }
+    if (res == SC_DISPLAY_RESULT_PENDING) {
+        // Not an error, but do not continue
+        return true;
+    }
+
+    res = sc_display_update_texture(&screen->display, frame);
+    if (res == SC_DISPLAY_RESULT_ERROR) {
+        return false;
+    }
+    if (res == SC_DISPLAY_RESULT_PENDING) {
+        // Not an error, but do not continue
+        return true;
+    }
+
+    if (!screen->has_frame) {
+        screen->has_frame = true;
+        // this is the very first frame, show the window
+        sc_screen_show_initial_window(screen);
+
+        if (sc_screen_is_relative_mode(screen)) {
+            // Capture mouse on start
+            sc_mouse_capture_set_active(&screen->mc, true);
         }
-
-        sc_adb_devices_log(SC_LOG_LEVEL_ERROR, vec.data, vec.size);
-        sc_adb_devices_destroy(&vec);
-        return false;
     }
 
-    if (sel_count > 1) {
-        switch (selector->type) {
-            case SC_ADB_DEVICE_SELECT_ALL:
-                LOGE("Multiple (%" SC_PRIsizet ") ADB devices:", sel_count);
-                break;
-            case SC_ADB_DEVICE_SELECT_SERIAL:
-                assert(selector->serial);
-                LOGE("Multiple (%" SC_PRIsizet ") ADB devices with serial %s:",
-                     sel_count, selector->serial);
-                break;
-            case SC_ADB_DEVICE_SELECT_USB:
-                LOGE("Multiple (%" SC_PRIsizet ") ADB devices over USB:",
-                     sel_count);
-                break;
-            case SC_ADB_DEVICE_SELECT_TCPIP:
-                LOGE("Multiple (%" SC_PRIsizet ") ADB devices over TCP/IP:",
-                     sel_count);
-                break;
-            default:
-                assert(!"Unexpected selector type");
-                break;
-        }
-        sc_adb_devices_log(SC_LOG_LEVEL_ERROR, vec.data, vec.size);
-        LOGE("Select a device via -s (--serial), -d (--select-usb) or -e "
-             "(--select-tcpip)");
-        sc_adb_devices_destroy(&vec);
-        return false;
-    }
-
-    assert(sel_count == 1); // sel_idx is valid only if sel_count == 1
-    struct sc_adb_device *device = &vec.data[sel_idx];
-
-    ok = sc_adb_device_check_state(device, vec.data, vec.size);
-    if (!ok) {
-        sc_adb_devices_destroy(&vec);
-        return false;
-    }
-
-    LOGI("ADB device found:");
-    sc_adb_devices_log(SC_LOG_LEVEL_INFO, vec.data, vec.size);
-
-    // Move devics into out_device (do not destroy device)
-    sc_adb_device_move(out_device, device);
-    sc_adb_devices_destroy(&vec);
+    sc_screen_render(screen, false);
     return true;
 }
 
-char *
-sc_adb_getprop(struct sc_intr *intr, const char *serial, const char *prop,
-               unsigned flags) {
-    assert(serial);
-    const char *const argv[] =
-        SC_ADB_COMMAND("-s", serial, "shell", "getprop", prop);
+static bool
+sc_screen_update_frame(struct sc_screen *screen) {
+    assert(screen->video);
 
-    sc_pipe pout;
-    sc_pid pid = sc_adb_execute_p(argv, flags, &pout);
-    if (pid == SC_PROCESS_NONE) {
-        LOGE("Could not execute \"adb getprop\"");
-        return NULL;
+    if (screen->paused) {
+        if (!screen->resume_frame) {
+            screen->resume_frame = av_frame_alloc();
+            if (!screen->resume_frame) {
+                LOG_OOM();
+                return false;
+            }
+        } else {
+            av_frame_unref(screen->resume_frame);
+        }
+        sc_frame_buffer_consume(&screen->fb, screen->resume_frame);
+        return true;
     }
 
-    char buf[128];
-    ssize_t r = sc_pipe_read_all_intr(intr, pid, pout, buf, sizeof(buf) - 1);
-    sc_pipe_close(pout);
-
-    bool ok = process_check_success_intr(intr, pid, "adb getprop", flags);
-    if (!ok) {
-        return NULL;
-    }
-
-    if (r == -1) {
-        return NULL;
-    }
-
-    assert((size_t) r < sizeof(buf));
-    buf[r] = '\0';
-    size_t len = strcspn(buf, " \r\n");
-    buf[len] = '\0';
-
-    return strdup(buf);
+    av_frame_unref(screen->frame);
+    sc_frame_buffer_consume(&screen->fb, screen->frame);
+    return sc_screen_apply_frame(screen);
 }
 
-char *
-sc_adb_get_device_ip(struct sc_intr *intr, const char *serial, unsigned flags) {
-    assert(serial);
-    const char *const argv[] =
-        SC_ADB_COMMAND("-s", serial, "shell", "ip", "route");
+void
+sc_screen_set_paused(struct sc_screen *screen, bool paused) {
+    assert(screen->video);
 
-    sc_pipe pout;
-    sc_pid pid = sc_adb_execute_p(argv, flags, &pout);
-    if (pid == SC_PROCESS_NONE) {
-        LOGD("Could not execute \"ip route\"");
-        return NULL;
+    if (!paused && !screen->paused) {
+        // nothing to do
+        return;
     }
 
-    // "adb shell ip route" output should contain only a few lines
-    char buf[1024];
-    ssize_t r = sc_pipe_read_all_intr(intr, pid, pout, buf, sizeof(buf) - 1);
-    sc_pipe_close(pout);
-
-    bool ok = process_check_success_intr(intr, pid, "ip route", flags);
-    if (!ok) {
-        return NULL;
+    if (screen->paused && screen->resume_frame) {
+        // If display screen was paused, refresh the frame immediately, even if
+        // the new state is also paused.
+        av_frame_free(&screen->frame);
+        screen->frame = screen->resume_frame;
+        screen->resume_frame = NULL;
+        sc_screen_apply_frame(screen);
     }
 
-    if (r == -1) {
-        return NULL;
+    if (!paused) {
+        LOGI("Display screen unpaused");
+    } else if (!screen->paused) {
+        LOGI("Display screen paused");
+    } else {
+        LOGI("Display screen re-paused");
     }
 
-    assert((size_t) r < sizeof(buf));
-    if (r == sizeof(buf) - 1)  {
-        // The implementation assumes that the output of "ip route" fits in the
-        // buffer in a single pass
-        LOGW("Result of \"ip route\" does not fit in 1Kb. "
-             "Please report an issue.");
-        return NULL;
-    }
-
-    // It is parsed as a NUL-terminated string
-    buf[r] = '\0';
-
-    return sc_adb_parse_device_ip(buf);
+    screen->paused = paused;
 }
 
-uint16_t
-sc_adb_get_device_sdk_version(struct sc_intr *intr, const char *serial) {
-    char *sdk_version =
-        sc_adb_getprop(intr, serial, "ro.build.version.sdk", SC_ADB_SILENT);
-    if (!sdk_version) {
-        return 0;
+void
+sc_screen_toggle_fullscreen(struct sc_screen *screen) {
+    assert(screen->video);
+
+    uint32_t new_mode = screen->fullscreen ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP;
+    if (SDL_SetWindowFullscreen(screen->window, new_mode)) {
+        LOGW("Could not switch fullscreen mode: %s", SDL_GetError());
+        return;
     }
 
-    long value;
-    bool ok = sc_str_parse_integer(sdk_version, &value);
-    free(sdk_version);
-    if (!ok || value < 0 || value > 0xFFFF) {
-        return 0;
+    screen->fullscreen = !screen->fullscreen;
+    if (!screen->fullscreen && !screen->maximized && !screen->minimized) {
+        apply_pending_resize(screen);
     }
 
-    return value;
+    LOGD("Switched to %s mode", screen->fullscreen ? "fullscreen" : "windowed");
+    sc_screen_render(screen, true);
+}
+
+void
+sc_screen_resize_to_fit(struct sc_screen *screen) {
+    assert(screen->video);
+
+    if (screen->fullscreen || screen->maximized || screen->minimized) {
+        return;
+    }
+
+    struct sc_point point = get_window_position(screen);
+    struct sc_size window_size = get_window_size(screen);
+
+    struct sc_size optimal_size =
+        get_optimal_size(window_size, screen->content_size, false);
+
+    // Center the window related to the device screen
+    assert(optimal_size.width <= window_size.width);
+    assert(optimal_size.height <= window_size.height);
+    uint32_t new_x = point.x + (window_size.width - optimal_size.width) / 2;
+    uint32_t new_y = point.y + (window_size.height - optimal_size.height) / 2;
+
+    SDL_SetWindowSize(screen->window, optimal_size.width, optimal_size.height);
+    SDL_SetWindowPosition(screen->window, new_x, new_y);
+    LOGD("Resized to optimal size: %ux%u", optimal_size.width,
+                                           optimal_size.height);
+}
+
+void
+sc_screen_resize_to_pixel_perfect(struct sc_screen *screen) {
+    assert(screen->video);
+
+    if (screen->fullscreen || screen->minimized) {
+        return;
+    }
+
+    if (screen->maximized) {
+        SDL_RestoreWindow(screen->window);
+        screen->maximized = false;
+    }
+
+    struct sc_size content_size = screen->content_size;
+    SDL_SetWindowSize(screen->window, content_size.width, content_size.height);
+    LOGD("Resized to pixel-perfect: %ux%u", content_size.width,
+                                            content_size.height);
+}
+
+bool
+sc_screen_handle_event(struct sc_screen *screen, const SDL_Event *event) {
+    switch (event->type) {
+        case SC_EVENT_SCREEN_INIT_SIZE: {
+            // The initial size is passed via screen->frame_size
+            bool ok = sc_screen_init_size(screen);
+            if (!ok) {
+                LOGE("Could not initialize screen size");
+                return false;
+            }
+            return true;
+        }
+        case SC_EVENT_NEW_FRAME: {
+            bool ok = sc_screen_update_frame(screen);
+            if (!ok) {
+                LOGE("Frame update failed\n");
+                return false;
+            }
+            return true;
+        }
+        case SDL_WINDOWEVENT:
+            if (!screen->video
+                    && event->window.event == SDL_WINDOWEVENT_EXPOSED) {
+                sc_screen_render_novideo(screen);
+            }
+
+            // !video implies !has_frame
+            assert(screen->video || !screen->has_frame);
+            if (!screen->has_frame) {
+                // Do nothing
+                return true;
+            }
+            switch (event->window.event) {
+                case SDL_WINDOWEVENT_EXPOSED:
+                    sc_screen_render(screen, true);
+                    break;
+                case SDL_WINDOWEVENT_SIZE_CHANGED:
+                    sc_screen_render(screen, true);
+                    break;
+                case SDL_WINDOWEVENT_MAXIMIZED:
+                    screen->maximized = true;
+                    break;
+                case SDL_WINDOWEVENT_MINIMIZED:
+                    screen->minimized = true;
+                    break;
+                case SDL_WINDOWEVENT_RESTORED:
+                    if (screen->fullscreen) {
+                        // On Windows, in maximized+fullscreen, disabling
+                        // fullscreen mode unexpectedly triggers the "restored"
+                        // then "maximized" events, leaving the window in a
+                        // weird state (maximized according to the events, but
+                        // not maximized visually).
+                        break;
+                    }
+                    screen->maximized = false;
+                    screen->minimized = false;
+                    apply_pending_resize(screen);
+                    sc_screen_render(screen, true);
+                    break;
+            }
+            return true;
+    }
+
+    if (sc_screen_is_relative_mode(screen)
+            && sc_mouse_capture_handle_event(&screen->mc, event)) {
+        // The mouse capture handler consumed the event
+        return true;
+    }
+
+    sc_input_manager_handle_event(&screen->im, event);
+    return true;
+}
+
+struct sc_point
+sc_screen_convert_drawable_to_frame_coords(struct sc_screen *screen,
+                                           int32_t x, int32_t y) {
+    assert(screen->video);
+
+    enum sc_orientation orientation = screen->orientation;
+
+    int32_t w = screen->content_size.width;
+    int32_t h = screen->content_size.height;
+
+    // screen->rect must be initialized to avoid a division by zero
+    assert(screen->rect.w && screen->rect.h);
+
+    x = (int64_t) (x - screen->rect.x) * w / screen->rect.w;
+    y = (int64_t) (y - screen->rect.y) * h / screen->rect.h;
+
+    struct sc_point result;
+    switch (orientation) {
+        case SC_ORIENTATION_0:
+            result.x = x;
+            result.y = y;
+            break;
+        case SC_ORIENTATION_90:
+            result.x = y;
+            result.y = w - x;
+            break;
+        case SC_ORIENTATION_180:
+            result.x = w - x;
+            result.y = h - y;
+            break;
+        case SC_ORIENTATION_270:
+            result.x = h - y;
+            result.y = x;
+            break;
+        case SC_ORIENTATION_FLIP_0:
+            result.x = w - x;
+            result.y = y;
+            break;
+        case SC_ORIENTATION_FLIP_90:
+            result.x = h - y;
+            result.y = w - x;
+            break;
+        case SC_ORIENTATION_FLIP_180:
+            result.x = x;
+            result.y = h - y;
+            break;
+        default:
+            assert(orientation == SC_ORIENTATION_FLIP_270);
+            result.x = y;
+            result.y = x;
+            break;
+    }
+
+    return result;
+}
+
+struct sc_point
+sc_screen_convert_window_to_frame_coords(struct sc_screen *screen,
+                                         int32_t x, int32_t y) {
+    sc_screen_hidpi_scale_coords(screen, &x, &y);
+    return sc_screen_convert_drawable_to_frame_coords(screen, x, y);
+}
+
+void
+sc_screen_hidpi_scale_coords(struct sc_screen *screen, int32_t *x, int32_t *y) {
+    // take the HiDPI scaling (dw/ww and dh/wh) into account
+    int ww, wh, dw, dh;
+    SDL_GetWindowSize(screen->window, &ww, &wh);
+    SDL_GL_GetDrawableSize(screen->window, &dw, &dh);
+
+    // scale for HiDPI (64 bits for intermediate multiplications)
+    *x = (int64_t) *x * dw / ww;
+    *y = (int64_t) *y * dh / wh;
 }

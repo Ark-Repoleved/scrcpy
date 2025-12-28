@@ -152,6 +152,13 @@ sdl_set_hints(const char *render_driver) {
     if (!SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1")) {
         LOGW("Could not allow joystick background events");
     }
+
+#ifdef _WIN32
+    // Enable native IME UI (candidate window) on Windows for CJK input
+    if (!SDL_SetHint(SDL_HINT_IME_SHOW_UI, "1")) {
+        LOGW("Could not enable IME UI");
+    }
+#endif
 }
 
 static void

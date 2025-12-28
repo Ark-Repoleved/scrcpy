@@ -350,15 +350,11 @@ public class Controller implements AsyncProcessor, VirtualDisplayListener {
         String decomposed = KeyComposition.decompose(c);
         char[] chars = decomposed != null ? decomposed.toCharArray() : new char[]{c};
         KeyEvent[] events = charMap.getEvents(chars);
-
-        int actionDisplayId = getActionDisplayId();
-
         if (events == null) {
-            long now = SystemClock.uptimeMillis();
-            KeyEvent event = new KeyEvent(now, String.valueOf(c), KeyCharacterMap.VIRTUAL_KEYBOARD, 0);
-            return Device.injectEvent(event, actionDisplayId, Device.INJECT_MODE_ASYNC);
+            return false;
         }
 
+        int actionDisplayId = getActionDisplayId();
         for (KeyEvent event : events) {
             if (!Device.injectEvent(event, actionDisplayId, Device.INJECT_MODE_ASYNC)) {
                 return false;

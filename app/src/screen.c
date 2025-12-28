@@ -1,792 +1,757 @@
-#include "adb.h"
+package com.genymobile.scrcpy.control;
 
-#include <assert.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/types.h>
+import com.genymobile.scrcpy.AndroidVersions;
+import com.genymobile.scrcpy.AsyncProcessor;
+import com.genymobile.scrcpy.CleanUp;
+import com.genymobile.scrcpy.Options;
+import com.genymobile.scrcpy.device.Device;
+import com.genymobile.scrcpy.device.DeviceApp;
+import com.genymobile.scrcpy.device.DisplayInfo;
+import com.genymobile.scrcpy.device.Point;
+import com.genymobile.scrcpy.device.Position;
+import com.genymobile.scrcpy.device.Size;
+import com.genymobile.scrcpy.util.Ln;
+import com.genymobile.scrcpy.util.LogUtils;
+import com.genymobile.scrcpy.video.SurfaceCapture;
+import com.genymobile.scrcpy.video.VirtualDisplayListener;
+import com.genymobile.scrcpy.wrappers.ClipboardManager;
+import com.genymobile.scrcpy.wrappers.InputManager;
+import com.genymobile.scrcpy.wrappers.ServiceManager;
 
-#include "adb/adb_device.h"
-#include "adb/adb_parser.h"
-#include "util/env.h"
-#include "util/file.h"
-#include "util/log.h"
-#include "util/process_intr.h"
-#include "util/str.h"
+import android.content.Intent;
+import android.os.Build;
+import android.os.SystemClock;
+import android.util.Pair;
+import android.view.InputDevice;
+import android.view.KeyCharacterMap;
+import android.view.KeyEvent;
+import android.view.MotionEvent;
 
-/* Convenience macro to expand:
- *
- *     const char *const argv[] =
- *         SC_ADB_COMMAND("shell", "echo", "hello");
- *
- * to:
- *
- *     const char *const argv[] =
- *         { sc_adb_get_executable(), "shell", "echo", "hello", NULL };
- */
-#define SC_ADB_COMMAND(...) { sc_adb_get_executable(), __VA_ARGS__, NULL }
+import java.io.IOException;
+import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
-static char *adb_executable;
+public class Controller implements AsyncProcessor, VirtualDisplayListener {
 
-bool
-sc_adb_init(void) {
-    adb_executable = sc_get_env("ADB");
-    if (adb_executable) {
-        LOGD("Using adb: %s", adb_executable);
-        return true;
-    }
+    /*
+     * For event injection, there are two display ids:
+     *  - the displayId passed to the constructor (which comes from --display-id passed by the client, 0 for the main display);
+     *  - the virtualDisplayId used for mirroring, notified by the capture instance via the VirtualDisplayListener interface.
+     *
+     * (In case the ScreenCapture uses the "SurfaceControl API", then both ids are equals, but this is an implementation detail.)
+     *
+     * In order to make events work correctly in all cases:
+     *  - virtualDisplayId must be used for events relative to the display (mouse and touch events with coordinates);
+     *  - displayId must be used for other events (like key events).
+     *
+     * If a new separate virtual display is created (using --new-display), then displayId == Device.DISPLAY_ID_NONE. In that case, all events are
+     * sent to the virtual display id.
+     */
 
-#if !defined(PORTABLE) || defined(_WIN32)
-    adb_executable = strdup("adb");
-    if (!adb_executable) {
-        LOG_OOM();
-        return false;
-    }
-#else
-    // For portable builds, use the absolute path to the adb executable
-    // in the same directory as scrcpy (except on Windows, where "adb"
-    // is sufficient)
-    adb_executable = sc_file_get_local_path("adb");
-    if (!adb_executable) {
-        // Error already logged
-        return false;
-    }
+    private static final class DisplayData {
+        private final int virtualDisplayId;
+        private final PositionMapper positionMapper;
 
-    LOGD("Using adb (portable): %s", adb_executable);
-#endif
-
-    return true;
-}
-
-void
-sc_adb_destroy(void) {
-    free(adb_executable);
-}
-
-const char *
-sc_adb_get_executable(void) {
-    return adb_executable;
-}
-
-// serialize argv to string "[arg1], [arg2], [arg3]"
-static size_t
-argv_to_string(const char *const *argv, char *buf, size_t bufsize) {
-    size_t idx = 0;
-    bool first = true;
-    while (*argv) {
-        const char *arg = *argv;
-        size_t len = strlen(arg);
-        // count space for "[], ...\0"
-        if (idx + len + 8 >= bufsize) {
-            // not enough space, truncate
-            assert(idx < bufsize - 4);
-            memcpy(&buf[idx], "...", 3);
-            idx += 3;
-            break;
-        }
-        if (first) {
-            first = false;
-        } else {
-            buf[idx++] = ',';
-            buf[idx++] = ' ';
-        }
-        buf[idx++] = '[';
-        memcpy(&buf[idx], arg, len);
-        idx += len;
-        buf[idx++] = ']';
-        argv++;
-    }
-    assert(idx < bufsize);
-    buf[idx] = '\0';
-    return idx;
-}
-
-static void
-show_adb_installation_msg(void) {
-#ifndef _WIN32
-    static const struct {
-        const char *binary;
-        const char *command;
-    } pkg_managers[] = {
-        {"apt", "apt install adb"},
-        {"apt-get", "apt-get install adb"},
-        {"brew", "brew install --cask android-platform-tools"},
-        {"dnf", "dnf install android-tools"},
-        {"emerge", "emerge dev-util/android-tools"},
-        {"pacman", "pacman -S android-tools"},
-    };
-    for (size_t i = 0; i < ARRAY_LEN(pkg_managers); ++i) {
-        if (sc_file_executable_exists(pkg_managers[i].binary)) {
-            LOGI("You may install 'adb' by \"%s\"", pkg_managers[i].command);
-            return;
+        private DisplayData(int virtualDisplayId, PositionMapper positionMapper) {
+            this.virtualDisplayId = virtualDisplayId;
+            this.positionMapper = positionMapper;
         }
     }
-#endif
-}
 
-static void
-show_adb_err_msg(enum sc_process_result err, const char *const argv[]) {
-#define MAX_COMMAND_STRING_LEN 1024
-    char *buf = malloc(MAX_COMMAND_STRING_LEN);
-    if (!buf) {
-        LOG_OOM();
-        LOGE("Failed to execute");
-        return;
-    }
+    private static final int DEFAULT_DEVICE_ID = 0;
 
-    switch (err) {
-        case SC_PROCESS_ERROR_GENERIC:
-            argv_to_string(argv, buf, MAX_COMMAND_STRING_LEN);
-            LOGE("Failed to execute: %s", buf);
-            break;
-        case SC_PROCESS_ERROR_MISSING_BINARY:
-            argv_to_string(argv, buf, MAX_COMMAND_STRING_LEN);
-            LOGE("Command not found: %s", buf);
-            LOGE("(make 'adb' accessible from your PATH or define its full"
-                 "path in the ADB environment variable)");
-            show_adb_installation_msg();
-            break;
-        case SC_PROCESS_SUCCESS:
-            // do nothing
-            break;
-    }
+    // control_msg.h values of the pointerId field in inject_touch_event message
+    private static final int POINTER_ID_MOUSE = -1;
 
-    free(buf);
-}
+    private static final ScheduledExecutorService EXECUTOR = Executors.newSingleThreadScheduledExecutor();
+    private ExecutorService startAppExecutor;
 
-static bool
-process_check_success_internal(sc_pid pid, const char *name, bool close,
-                               unsigned flags) {
-    bool log_errors = !(flags & SC_ADB_NO_LOGERR);
+    private Thread thread;
 
-    if (pid == SC_PROCESS_NONE) {
-        if (log_errors) {
-            LOGE("Could not execute \"%s\"", name);
+    private UhidManager uhidManager;
+
+    private final int displayId;
+    private final boolean supportsInputEvents;
+    private final ControlChannel controlChannel;
+    private final CleanUp cleanUp;
+    private final DeviceMessageSender sender;
+    private final boolean clipboardAutosync;
+    private final boolean powerOn;
+
+    private final KeyCharacterMap charMap = KeyCharacterMap.load(KeyCharacterMap.VIRTUAL_KEYBOARD);
+
+    private final AtomicBoolean isSettingClipboard = new AtomicBoolean();
+
+    private final AtomicReference<DisplayData> displayData = new AtomicReference<>();
+    private final Object displayDataAvailable = new Object(); // condition variable
+
+    private long lastTouchDown;
+    private final PointersState pointersState = new PointersState();
+    private final MotionEvent.PointerProperties[] pointerProperties = new MotionEvent.PointerProperties[PointersState.MAX_POINTERS];
+    private final MotionEvent.PointerCoords[] pointerCoords = new MotionEvent.PointerCoords[PointersState.MAX_POINTERS];
+
+    private boolean keepDisplayPowerOff;
+
+    // Used for resetting video encoding on RESET_VIDEO message
+    private SurfaceCapture surfaceCapture;
+
+    public Controller(ControlChannel controlChannel, CleanUp cleanUp, Options options) {
+        this.displayId = options.getDisplayId();
+        this.controlChannel = controlChannel;
+        this.cleanUp = cleanUp;
+        this.clipboardAutosync = options.getClipboardAutosync();
+        this.powerOn = options.getPowerOn();
+        initPointers();
+        sender = new DeviceMessageSender(controlChannel);
+
+        supportsInputEvents = Device.supportsInputEvents(displayId);
+        if (!supportsInputEvents) {
+            Ln.w("Input events are not supported for secondary displays before Android 10");
         }
-        return false;
-    }
-    sc_exit_code exit_code = sc_process_wait(pid, close);
-    if (exit_code) {
-        if (log_errors) {
-            if (exit_code != SC_EXIT_CODE_NONE) {
-                LOGE("\"%s\" returned with value %" SC_PRIexitcode, name,
-                     exit_code);
+
+        // Make sure the clipboard manager is always created from the main thread (even if clipboardAutosync is disabled)
+        ClipboardManager clipboardManager = ServiceManager.getClipboardManager();
+        if (clipboardAutosync) {
+            // If control and autosync are enabled, synchronize Android clipboard to the computer automatically
+            if (clipboardManager != null) {
+                clipboardManager.addPrimaryClipChangedListener(() -> {
+                    if (isSettingClipboard.get()) {
+                        // This is a notification for the change we are currently applying, ignore it
+                        return;
+                    }
+                    String text = Device.getClipboardText();
+                    if (text != null) {
+                        DeviceMessage msg = DeviceMessage.createClipboard(text);
+                        sender.send(msg);
+                    }
+                });
             } else {
-                LOGE("\"%s\" exited unexpectedly", name);
+                Ln.w("No clipboard manager, copy-paste between device and computer will not work");
             }
         }
-        return false;
-    }
-    return true;
-}
-
-static bool
-process_check_success_intr(struct sc_intr *intr, sc_pid pid, const char *name,
-                           unsigned flags) {
-    if (intr && !sc_intr_set_process(intr, pid)) {
-        // Already interrupted
-        return false;
     }
 
-    // Always pass close=false, interrupting would be racy otherwise
-    bool ret = process_check_success_internal(pid, name, false, flags);
-
-    if (intr) {
-        sc_intr_set_process(intr, SC_PROCESS_NONE);
+    @Override
+    public void onNewVirtualDisplay(int virtualDisplayId, PositionMapper positionMapper) {
+        DisplayData data = new DisplayData(virtualDisplayId, positionMapper);
+        DisplayData old = this.displayData.getAndSet(data);
+        if (old == null) {
+            // The very first time the Controller is notified of a new virtual display
+            synchronized (displayDataAvailable) {
+                displayDataAvailable.notify();
+            }
+        }
     }
 
-    // Close separately
-    sc_process_close(pid);
-
-    return ret;
-}
-
-static sc_pid
-sc_adb_execute_p(const char *const argv[], unsigned flags, sc_pipe *pout) {
-    unsigned process_flags = 0;
-    if (flags & SC_ADB_NO_STDOUT) {
-        process_flags |= SC_PROCESS_NO_STDOUT;
-    }
-    if (flags & SC_ADB_NO_STDERR) {
-        process_flags |= SC_PROCESS_NO_STDERR;
+    public void setSurfaceCapture(SurfaceCapture surfaceCapture) {
+        this.surfaceCapture = surfaceCapture;
     }
 
-    sc_pid pid;
-    enum sc_process_result r =
-        sc_process_execute_p(argv, &pid, process_flags, NULL, pout, NULL);
-    if (r != SC_PROCESS_SUCCESS) {
-        // If the execution itself failed (not the command exit code), log the
-        // error in all cases
-        show_adb_err_msg(r, argv);
-        pid = SC_PROCESS_NONE;
-    }
-
-    return pid;
-}
-
-sc_pid
-sc_adb_execute(const char *const argv[], unsigned flags) {
-    return sc_adb_execute_p(argv, flags, NULL);
-}
-
-bool
-sc_adb_start_server(struct sc_intr *intr, unsigned flags) {
-    const char *const argv[] = SC_ADB_COMMAND("start-server");
-
-    sc_pid pid = sc_adb_execute(argv, flags);
-    return process_check_success_intr(intr, pid, "adb start-server", flags);
-}
-
-bool
-sc_adb_kill_server(struct sc_intr *intr, unsigned flags) {
-    const char *const argv[] = SC_ADB_COMMAND("kill-server");
-
-    sc_pid pid = sc_adb_execute(argv, flags);
-    return process_check_success_intr(intr, pid, "adb kill-server", flags);
-}
-
-bool
-sc_adb_forward(struct sc_intr *intr, const char *serial, uint16_t local_port,
-               const char *device_socket_name, unsigned flags) {
-    char local[4 + 5 + 1]; // tcp:PORT
-    char remote[108 + 14 + 1]; // localabstract:NAME
-
-    int r = snprintf(local, sizeof(local), "tcp:%" PRIu16, local_port);
-    assert(r >= 0 && (size_t) r < sizeof(local));
-
-    r = snprintf(remote, sizeof(remote), "localabstract:%s",
-                 device_socket_name);
-    if (r < 0 || (size_t) r >= sizeof(remote)) {
-        LOGE("Could not write socket name");
-        return false;
-    }
-
-    assert(serial);
-    const char *const argv[] =
-        SC_ADB_COMMAND("-s", serial, "forward", local, remote);
-
-    sc_pid pid = sc_adb_execute(argv, flags);
-    return process_check_success_intr(intr, pid, "adb forward", flags);
-}
-
-bool
-sc_adb_forward_remove(struct sc_intr *intr, const char *serial,
-                      uint16_t local_port, unsigned flags) {
-    char local[4 + 5 + 1]; // tcp:PORT
-    int r = snprintf(local, sizeof(local), "tcp:%" PRIu16, local_port);
-    assert(r >= 0 && (size_t) r < sizeof(local));
-    (void) r;
-
-    assert(serial);
-    const char *const argv[] =
-        SC_ADB_COMMAND("-s", serial, "forward", "--remove", local);
-
-    sc_pid pid = sc_adb_execute(argv, flags);
-    return process_check_success_intr(intr, pid, "adb forward --remove", flags);
-}
-
-bool
-sc_adb_reverse(struct sc_intr *intr, const char *serial,
-               const char *device_socket_name, uint16_t local_port,
-               unsigned flags) {
-    char local[4 + 5 + 1]; // tcp:PORT
-    char remote[108 + 14 + 1]; // localabstract:NAME
-    int r = snprintf(local, sizeof(local), "tcp:%" PRIu16, local_port);
-    assert(r >= 0 && (size_t) r < sizeof(local));
-
-    r = snprintf(remote, sizeof(remote), "localabstract:%s",
-                 device_socket_name);
-    if (r < 0 || (size_t) r >= sizeof(remote)) {
-        LOGE("Could not write socket name");
-        return false;
-    }
-
-    assert(serial);
-    const char *const argv[] =
-        SC_ADB_COMMAND("-s", serial, "reverse", remote, local);
-
-    sc_pid pid = sc_adb_execute(argv, flags);
-    return process_check_success_intr(intr, pid, "adb reverse", flags);
-}
-
-bool
-sc_adb_reverse_remove(struct sc_intr *intr, const char *serial,
-                      const char *device_socket_name, unsigned flags) {
-    char remote[108 + 14 + 1]; // localabstract:NAME
-    int r = snprintf(remote, sizeof(remote), "localabstract:%s",
-                     device_socket_name);
-    if (r < 0 || (size_t) r >= sizeof(remote)) {
-        LOGE("Device socket name too long");
-        return false;
-    }
-
-    assert(serial);
-    const char *const argv[] =
-        SC_ADB_COMMAND("-s", serial, "reverse", "--remove", remote);
-
-    sc_pid pid = sc_adb_execute(argv, flags);
-    return process_check_success_intr(intr, pid, "adb reverse --remove", flags);
-}
-
-bool
-sc_adb_push(struct sc_intr *intr, const char *serial, const char *local,
-            const char *remote, unsigned flags) {
-#ifdef _WIN32
-    // Windows will parse the string, so the paths must be quoted
-    // (see sys/win/command.c)
-    local = sc_str_quote(local);
-    if (!local) {
-        return SC_PROCESS_NONE;
-    }
-    remote = sc_str_quote(remote);
-    if (!remote) {
-        free((void *) local);
-        return SC_PROCESS_NONE;
-    }
-#endif
-
-    assert(serial);
-    const char *const argv[] =
-        SC_ADB_COMMAND("-s", serial, "push", local, remote);
-
-    sc_pid pid = sc_adb_execute(argv, flags);
-
-#ifdef _WIN32
-    free((void *) remote);
-    free((void *) local);
-#endif
-
-    return process_check_success_intr(intr, pid, "adb push", flags);
-}
-
-bool
-sc_adb_install(struct sc_intr *intr, const char *serial, const char *local,
-               unsigned flags) {
-#ifdef _WIN32
-    // Windows will parse the string, so the local name must be quoted
-    // (see sys/win/command.c)
-    local = sc_str_quote(local);
-    if (!local) {
-        return SC_PROCESS_NONE;
-    }
-#endif
-
-    assert(serial);
-    const char *const argv[] =
-        SC_ADB_COMMAND("-s", serial, "install", "-r", local);
-
-    sc_pid pid = sc_adb_execute(argv, flags);
-
-#ifdef _WIN32
-    free((void *) local);
-#endif
-
-    return process_check_success_intr(intr, pid, "adb install", flags);
-}
-
-bool
-sc_adb_tcpip(struct sc_intr *intr, const char *serial, uint16_t port,
-             unsigned flags) {
-    char port_string[5 + 1];
-    int r = snprintf(port_string, sizeof(port_string), "%" PRIu16, port);
-    assert(r >= 0 && (size_t) r < sizeof(port_string));
-    (void) r;
-
-    assert(serial);
-    const char *const argv[] =
-        SC_ADB_COMMAND("-s", serial, "tcpip", port_string);
-
-    sc_pid pid = sc_adb_execute(argv, flags);
-    return process_check_success_intr(intr, pid, "adb tcpip", flags);
-}
-
-bool
-sc_adb_connect(struct sc_intr *intr, const char *ip_port, unsigned flags) {
-    const char *const argv[] = SC_ADB_COMMAND("connect", ip_port);
-
-    sc_pipe pout;
-    sc_pid pid = sc_adb_execute_p(argv, flags, &pout);
-    if (pid == SC_PROCESS_NONE) {
-        LOGE("Could not execute \"adb connect\"");
-        return false;
-    }
-
-    // "adb connect" always returns successfully (with exit code 0), even in
-    // case of failure. As a workaround, check if its output starts with
-    // "connected" or "already connected".
-    char buf[128];
-    ssize_t r = sc_pipe_read_all_intr(intr, pid, pout, buf, sizeof(buf) - 1);
-    sc_pipe_close(pout);
-
-    bool ok = process_check_success_intr(intr, pid, "adb connect", flags);
-    if (!ok) {
-        return false;
-    }
-
-    if (r == -1) {
-        return false;
-    }
-
-    assert((size_t) r < sizeof(buf));
-    buf[r] = '\0';
-
-    ok = !strncmp("connected", buf, sizeof("connected") - 1)
-        || !strncmp("already connected", buf, sizeof("already connected") - 1);
-    if (!ok && !(flags & SC_ADB_NO_STDERR)) {
-        // "adb connect" also prints errors to stdout. Since we capture it,
-        // re-print the error to stderr.
-        size_t len = strcspn(buf, "\r\n");
-        buf[len] = '\0';
-        fprintf(stderr, "%s\n", buf);
-    }
-    return ok;
-}
-
-bool
-sc_adb_disconnect(struct sc_intr *intr, const char *ip_port, unsigned flags) {
-    assert(ip_port);
-    const char *const argv[] = SC_ADB_COMMAND("disconnect", ip_port);
-
-    sc_pid pid = sc_adb_execute(argv, flags);
-    return process_check_success_intr(intr, pid, "adb disconnect", flags);
-}
-
-static bool
-sc_adb_list_devices(struct sc_intr *intr, unsigned flags,
-                    struct sc_vec_adb_devices *out_vec) {
-    const char *const argv[] = SC_ADB_COMMAND("devices", "-l");
-
-#define BUFSIZE 65536
-    char *buf = malloc(BUFSIZE);
-    if (!buf) {
-        LOG_OOM();
-        return false;
-    }
-
-    sc_pipe pout;
-    sc_pid pid = sc_adb_execute_p(argv, flags, &pout);
-    if (pid == SC_PROCESS_NONE) {
-        LOGE("Could not execute \"adb devices -l\"");
-        free(buf);
-        return false;
-    }
-
-    ssize_t r = sc_pipe_read_all_intr(intr, pid, pout, buf, BUFSIZE - 1);
-    sc_pipe_close(pout);
-
-    bool ok = process_check_success_intr(intr, pid, "adb devices -l", flags);
-    if (!ok) {
-        free(buf);
-        return false;
-    }
-
-    if (r == -1) {
-        free(buf);
-        return false;
-    }
-
-    assert((size_t) r < BUFSIZE);
-    if (r == BUFSIZE - 1)  {
-        // The implementation assumes that the output of "adb devices -l" fits
-        // in the buffer in a single pass
-        LOGW("Result of \"adb devices -l\" does not fit in 64Kb. "
-             "Please report an issue.");
-        free(buf);
-        return false;
-    }
-
-    // It is parsed as a NUL-terminated string
-    buf[r] = '\0';
-
-    // List all devices to the output list directly
-    ok = sc_adb_parse_devices(buf, out_vec);
-    free(buf);
-    return ok;
-}
-
-static bool
-sc_adb_accept_device(const struct sc_adb_device *device,
-                     const struct sc_adb_device_selector *selector) {
-    switch (selector->type) {
-        case SC_ADB_DEVICE_SELECT_ALL:
-            return true;
-        case SC_ADB_DEVICE_SELECT_SERIAL:
-            assert(selector->serial);
-            char *device_serial_colon = strchr(device->serial, ':');
-            if (device_serial_colon) {
-                // The device serial is an IP:port...
-                char *serial_colon = strchr(selector->serial, ':');
-                if (!serial_colon) {
-                    // But the requested serial has no ':', so only consider
-                    // the IP part of the device serial. This allows to use
-                    // "192.168.1.1" to match any "192.168.1.1:port".
-                    size_t serial_len = strlen(selector->serial);
-                    size_t device_ip_len = device_serial_colon - device->serial;
-                    if (serial_len != device_ip_len) {
-                        // They are not equal, they don't even have the same
-                        // length
-                        return false;
+    private UhidManager getUhidManager() {
+        if (uhidManager == null) {
+            int uhidDisplayId = displayId;
+            if (Build.VERSION.SDK_INT >= AndroidVersions.API_35_ANDROID_15) {
+                if (displayId == Device.DISPLAY_ID_NONE) {
+                    // Mirroring a new virtual display id (using --new-display-id feature) on Android >= 15, where the UHID mouse pointer can be
+                    // associated to the virtual display
+                    try {
+                        // Wait for at most 1 second until a virtual display id is known
+                        DisplayData data = waitDisplayData(1000);
+                        if (data != null) {
+                            uhidDisplayId = data.virtualDisplayId;
+                        }
+                    } catch (InterruptedException e) {
+                        // do nothing
                     }
-                    return !strncmp(selector->serial, device->serial,
-                                    device_ip_len);
                 }
             }
-            return !strcmp(selector->serial, device->serial);
-        case SC_ADB_DEVICE_SELECT_USB:
-            return sc_adb_device_get_type(device->serial) ==
-                    SC_ADB_DEVICE_TYPE_USB;
-        case SC_ADB_DEVICE_SELECT_TCPIP:
-            // Both emulators and TCP/IP devices are selected via -e
-            return sc_adb_device_get_type(device->serial) !=
-                    SC_ADB_DEVICE_TYPE_USB;
-        default:
-            assert(!"Missing SC_ADB_DEVICE_SELECT_* handling");
-            break;
+
+            String displayUniqueId = null;
+            if (uhidDisplayId > 0) {
+                // Ignore Device.DISPLAY_ID_NONE and 0 (main display)
+                DisplayInfo displayInfo = ServiceManager.getDisplayManager().getDisplayInfo(uhidDisplayId);
+                if (displayInfo != null) {
+                    displayUniqueId = displayInfo.getUniqueId();
+                }
+            }
+            uhidManager = new UhidManager(sender, displayUniqueId);
+        }
+
+        return uhidManager;
     }
 
-    return false;
-}
+    private void initPointers() {
+        for (int i = 0; i < PointersState.MAX_POINTERS; ++i) {
+            MotionEvent.PointerProperties props = new MotionEvent.PointerProperties();
+            props.toolType = MotionEvent.TOOL_TYPE_FINGER;
 
-static size_t
-sc_adb_devices_select(struct sc_adb_device *devices, size_t len,
-                      const struct sc_adb_device_selector *selector,
-                      size_t *idx_out) {
-    size_t count = 0;
-    for (size_t i = 0; i < len; ++i) {
-        struct sc_adb_device *device = &devices[i];
-        device->selected = sc_adb_accept_device(device, selector);
-        if (device->selected) {
-            if (idx_out && !count) {
-                *idx_out = i;
-            }
-            ++count;
+            MotionEvent.PointerCoords coords = new MotionEvent.PointerCoords();
+            coords.orientation = 0;
+            coords.size = 0;
+
+            pointerProperties[i] = props;
+            pointerCoords[i] = coords;
         }
     }
 
-    return count;
-}
+    private void control() throws IOException {
+        // on start, power on the device
+        if (powerOn && displayId == 0 && !Device.isScreenOn(displayId)) {
+            Device.pressReleaseKeycode(KeyEvent.KEYCODE_POWER, displayId, Device.INJECT_MODE_ASYNC);
 
-static void
-sc_adb_devices_log(enum sc_log_level level, struct sc_adb_device *devices,
-                   size_t count) {
-    for (size_t i = 0; i < count; ++i) {
-        struct sc_adb_device *d = &devices[i];
-        const char *selection = d->selected ? "-->" : "   ";
-        bool is_usb =
-            sc_adb_device_get_type(d->serial) == SC_ADB_DEVICE_TYPE_USB;
-        const char *type = is_usb ? "  (usb)"
-                                  : "(tcpip)";
-        LOG(level, "    %s %s  %-20s  %16s  %s",
-             selection, type, d->serial, d->state, d->model ? d->model : "");
+            // dirty hack
+            // After POWER is injected, the device is powered on asynchronously.
+            // To turn the device screen off while mirroring, the client will send a message that
+            // would be handled before the device is actually powered on, so its effect would
+            // be "canceled" once the device is turned back on.
+            // Adding this delay prevents to handle the message before the device is actually
+            // powered on.
+            SystemClock.sleep(500);
+        }
+
+        boolean alive = true;
+        while (!Thread.currentThread().isInterrupted() && alive) {
+            alive = handleEvent();
+        }
     }
-}
 
-static bool
-sc_adb_device_check_state(struct sc_adb_device *device,
-                          struct sc_adb_device *devices, size_t count) {
-    const char *state = device->state;
+    @Override
+    public void start(TerminationListener listener) {
+        thread = new Thread(() -> {
+            try {
+                control();
+            } catch (IOException e) {
+                Ln.e("Controller error", e);
+            } finally {
+                Ln.d("Controller stopped");
+                if (uhidManager != null) {
+                    uhidManager.closeAll();
+                }
+                listener.onTerminated(true);
+            }
+        }, "control-recv");
+        thread.start();
+        sender.start();
+    }
 
-    if (!strcmp("device", state)) {
+    @Override
+    public void stop() {
+        if (thread != null) {
+            thread.interrupt();
+        }
+        sender.stop();
+    }
+
+    @Override
+    public void join() throws InterruptedException {
+        if (thread != null) {
+            thread.join();
+        }
+        sender.join();
+    }
+
+    private boolean handleEvent() throws IOException {
+        ControlMessage msg;
+        try {
+            msg = controlChannel.recv();
+        } catch (IOException e) {
+            // this is expected on close
+            return false;
+        }
+
+        switch (msg.getType()) {
+            case ControlMessage.TYPE_INJECT_KEYCODE:
+                if (supportsInputEvents) {
+                    injectKeycode(msg.getAction(), msg.getKeycode(), msg.getRepeat(), msg.getMetaState());
+                }
+                break;
+            case ControlMessage.TYPE_INJECT_TEXT:
+                if (supportsInputEvents) {
+                    injectText(msg.getText());
+                }
+                break;
+            case ControlMessage.TYPE_INJECT_TOUCH_EVENT:
+                if (supportsInputEvents) {
+                    injectTouch(msg.getAction(), msg.getPointerId(), msg.getPosition(), msg.getPressure(), msg.getActionButton(), msg.getButtons());
+                }
+                break;
+            case ControlMessage.TYPE_INJECT_SCROLL_EVENT:
+                if (supportsInputEvents) {
+                    injectScroll(msg.getPosition(), msg.getHScroll(), msg.getVScroll(), msg.getButtons());
+                }
+                break;
+            case ControlMessage.TYPE_BACK_OR_SCREEN_ON:
+                if (supportsInputEvents) {
+                    pressBackOrTurnScreenOn(msg.getAction());
+                }
+                break;
+            case ControlMessage.TYPE_EXPAND_NOTIFICATION_PANEL:
+                Device.expandNotificationPanel();
+                break;
+            case ControlMessage.TYPE_EXPAND_SETTINGS_PANEL:
+                Device.expandSettingsPanel();
+                break;
+            case ControlMessage.TYPE_COLLAPSE_PANELS:
+                Device.collapsePanels();
+                break;
+            case ControlMessage.TYPE_GET_CLIPBOARD:
+                getClipboard(msg.getCopyKey());
+                break;
+            case ControlMessage.TYPE_SET_CLIPBOARD:
+                setClipboard(msg.getText(), msg.getPaste(), msg.getSequence());
+                break;
+            case ControlMessage.TYPE_SET_DISPLAY_POWER:
+                if (supportsInputEvents) {
+                    setDisplayPower(msg.getOn());
+                }
+                break;
+            case ControlMessage.TYPE_ROTATE_DEVICE:
+                Device.rotateDevice(getActionDisplayId());
+                break;
+            case ControlMessage.TYPE_UHID_CREATE:
+                getUhidManager().open(msg.getId(), msg.getVendorId(), msg.getProductId(), msg.getText(), msg.getData());
+                break;
+            case ControlMessage.TYPE_UHID_INPUT:
+                getUhidManager().writeInput(msg.getId(), msg.getData());
+                break;
+            case ControlMessage.TYPE_UHID_DESTROY:
+                getUhidManager().close(msg.getId());
+                break;
+            case ControlMessage.TYPE_OPEN_HARD_KEYBOARD_SETTINGS:
+                openHardKeyboardSettings();
+                break;
+            case ControlMessage.TYPE_START_APP:
+                startAppAsync(msg.getText());
+                break;
+            case ControlMessage.TYPE_RESET_VIDEO:
+                resetVideo();
+                break;
+            default:
+                // do nothing
+        }
+
         return true;
     }
 
-    if (!strcmp("unauthorized", state)) {
-        LOGE("Device is unauthorized:");
-        sc_adb_devices_log(SC_LOG_LEVEL_ERROR, devices, count);
-        LOGE("A popup should open on the device to request authorization.");
-        LOGE("Check the FAQ: "
-             "<https://github.com/Genymobile/scrcpy/blob/master/FAQ.md>");
-    } else {
-        LOGE("Device could not be connected (state=%s)", state);
+    private boolean injectKeycode(int action, int keycode, int repeat, int metaState) {
+        if (keepDisplayPowerOff && action == KeyEvent.ACTION_UP && (keycode == KeyEvent.KEYCODE_POWER || keycode == KeyEvent.KEYCODE_WAKEUP)) {
+            assert displayId != Device.DISPLAY_ID_NONE;
+            scheduleDisplayPowerOff(displayId);
+        }
+        return injectKeyEvent(action, keycode, repeat, metaState, Device.INJECT_MODE_ASYNC);
     }
 
-    return false;
-}
-
-bool
-sc_adb_select_device(struct sc_intr *intr,
-                     const struct sc_adb_device_selector *selector,
-                     unsigned flags, struct sc_adb_device *out_device) {
-    struct sc_vec_adb_devices vec = SC_VECTOR_INITIALIZER;
-    bool ok = sc_adb_list_devices(intr, flags, &vec);
-    if (!ok) {
-        LOGE("Could not list ADB devices");
-        return false;
-    }
-
-    if (vec.size == 0) {
-        LOGE("Could not find any ADB device");
-        return false;
-    }
-
-    size_t sel_idx; // index of the single matching device if sel_count == 1
-    size_t sel_count =
-        sc_adb_devices_select(vec.data, vec.size, selector, &sel_idx);
-
-    if (sel_count == 0) {
-        // if count > 0 && sel_count == 0, then necessarily a selection is
-        // requested
-        assert(selector->type != SC_ADB_DEVICE_SELECT_ALL);
-
-        switch (selector->type) {
-            case SC_ADB_DEVICE_SELECT_SERIAL:
-                assert(selector->serial);
-                LOGE("Could not find ADB device %s:", selector->serial);
-                break;
-            case SC_ADB_DEVICE_SELECT_USB:
-                LOGE("Could not find any ADB device over USB:");
-                break;
-            case SC_ADB_DEVICE_SELECT_TCPIP:
-                LOGE("Could not find any ADB device over TCP/IP:");
-                break;
-            default:
-                assert(!"Unexpected selector type");
-                break;
+    private boolean injectChar(char c) {
+        String decomposed = KeyComposition.decompose(c);
+        char[] chars = decomposed != null ? decomposed.toCharArray() : new char[]{c};
+        KeyEvent[] events = charMap.getEvents(chars);
+        if (events == null) {
+            return false;
         }
 
-        sc_adb_devices_log(SC_LOG_LEVEL_ERROR, vec.data, vec.size);
-        sc_adb_devices_destroy(&vec);
-        return false;
-    }
-
-    if (sel_count > 1) {
-        switch (selector->type) {
-            case SC_ADB_DEVICE_SELECT_ALL:
-                LOGE("Multiple (%" SC_PRIsizet ") ADB devices:", sel_count);
-                break;
-            case SC_ADB_DEVICE_SELECT_SERIAL:
-                assert(selector->serial);
-                LOGE("Multiple (%" SC_PRIsizet ") ADB devices with serial %s:",
-                     sel_count, selector->serial);
-                break;
-            case SC_ADB_DEVICE_SELECT_USB:
-                LOGE("Multiple (%" SC_PRIsizet ") ADB devices over USB:",
-                     sel_count);
-                break;
-            case SC_ADB_DEVICE_SELECT_TCPIP:
-                LOGE("Multiple (%" SC_PRIsizet ") ADB devices over TCP/IP:",
-                     sel_count);
-                break;
-            default:
-                assert(!"Unexpected selector type");
-                break;
+        int actionDisplayId = getActionDisplayId();
+        for (KeyEvent event : events) {
+            if (!Device.injectEvent(event, actionDisplayId, Device.INJECT_MODE_ASYNC)) {
+                return false;
+            }
         }
-        sc_adb_devices_log(SC_LOG_LEVEL_ERROR, vec.data, vec.size);
-        LOGE("Select a device via -s (--serial), -d (--select-usb) or -e "
-             "(--select-tcpip)");
-        sc_adb_devices_destroy(&vec);
-        return false;
+        return true;
     }
 
-    assert(sel_count == 1); // sel_idx is valid only if sel_count == 1
-    struct sc_adb_device *device = &vec.data[sel_idx];
-
-    ok = sc_adb_device_check_state(device, vec.data, vec.size);
-    if (!ok) {
-        sc_adb_devices_destroy(&vec);
-        return false;
+    private int injectText(String text) {
+        int successCount = 0;
+        for (char c : text.toCharArray()) {
+            if (!injectChar(c)) {
+                Ln.w("Could not inject char u+" + String.format("%04x", (int) c));
+                continue;
+            }
+            successCount++;
+        }
+        return successCount;
     }
 
-    LOGI("ADB device found:");
-    sc_adb_devices_log(SC_LOG_LEVEL_INFO, vec.data, vec.size);
+    private Pair<Point, Integer> getEventPointAndDisplayId(Position position) {
+        // it hides the field on purpose, to read it with atomic access
+        @SuppressWarnings("checkstyle:HiddenField")
+        DisplayData displayData = this.displayData.get();
+        // In scrcpy, displayData should never be null (a touch event can only be generated from the client when a video frame is present).
+        // However, it is possible to send events without video playback when using scrcpy-server alone (except for virtual displays).
+        assert displayData != null || displayId != Device.DISPLAY_ID_NONE : "Cannot receive a positional event without a display";
 
-    // Move devics into out_device (do not destroy device)
-    sc_adb_device_move(out_device, device);
-    sc_adb_devices_destroy(&vec);
-    return true;
-}
+        Point point;
+        int targetDisplayId;
+        if (displayData != null) {
+            point = displayData.positionMapper.map(position);
+            if (point == null) {
+                if (Ln.isEnabled(Ln.Level.VERBOSE)) {
+                    Size eventSize = position.getScreenSize();
+                    Size currentSize = displayData.positionMapper.getVideoSize();
+                    Ln.v("Ignore positional event generated for size " + eventSize + " (current size is " + currentSize + ")");
+                }
+                return null;
+            }
+            targetDisplayId = displayData.virtualDisplayId;
+        } else {
+            // No display, use the raw coordinates
+            point = position.getPoint();
+            targetDisplayId = displayId;
+        }
 
-char *
-sc_adb_getprop(struct sc_intr *intr, const char *serial, const char *prop,
-               unsigned flags) {
-    assert(serial);
-    const char *const argv[] =
-        SC_ADB_COMMAND("-s", serial, "shell", "getprop", prop);
-
-    sc_pipe pout;
-    sc_pid pid = sc_adb_execute_p(argv, flags, &pout);
-    if (pid == SC_PROCESS_NONE) {
-        LOGE("Could not execute \"adb getprop\"");
-        return NULL;
+        return Pair.create(point, targetDisplayId);
     }
 
-    char buf[128];
-    ssize_t r = sc_pipe_read_all_intr(intr, pid, pout, buf, sizeof(buf) - 1);
-    sc_pipe_close(pout);
+    private boolean injectTouch(int action, long pointerId, Position position, float pressure, int actionButton, int buttons) {
+        long now = SystemClock.uptimeMillis();
 
-    bool ok = process_check_success_intr(intr, pid, "adb getprop", flags);
-    if (!ok) {
-        return NULL;
+        Pair<Point, Integer> pair = getEventPointAndDisplayId(position);
+        if (pair == null) {
+            return false;
+        }
+
+        Point point = pair.first;
+        int targetDisplayId = pair.second;
+
+        int pointerIndex = pointersState.getPointerIndex(pointerId);
+        if (pointerIndex == -1) {
+            Ln.w("Too many pointers for touch event");
+            return false;
+        }
+        Pointer pointer = pointersState.get(pointerIndex);
+        pointer.setPoint(point);
+        pointer.setPressure(pressure);
+
+        int source;
+        boolean activeSecondaryButtons = ((actionButton | buttons) & ~MotionEvent.BUTTON_PRIMARY) != 0;
+        if (pointerId == POINTER_ID_MOUSE && (action == MotionEvent.ACTION_HOVER_MOVE || activeSecondaryButtons)) {
+            // real mouse event, or event incompatible with a finger
+            pointerProperties[pointerIndex].toolType = MotionEvent.TOOL_TYPE_MOUSE;
+            source = InputDevice.SOURCE_MOUSE;
+            pointer.setUp(buttons == 0);
+        } else {
+            // POINTER_ID_GENERIC_FINGER, POINTER_ID_VIRTUAL_FINGER or real touch from device
+            pointerProperties[pointerIndex].toolType = MotionEvent.TOOL_TYPE_FINGER;
+            source = InputDevice.SOURCE_TOUCHSCREEN;
+            // Buttons must not be set for touch events
+            buttons = 0;
+            pointer.setUp(action == MotionEvent.ACTION_UP);
+        }
+
+        int pointerCount = pointersState.update(pointerProperties, pointerCoords);
+        if (pointerCount == 1) {
+            if (action == MotionEvent.ACTION_DOWN) {
+                lastTouchDown = now;
+            }
+        } else {
+            // secondary pointers must use ACTION_POINTER_* ORed with the pointerIndex
+            if (action == MotionEvent.ACTION_UP) {
+                action = MotionEvent.ACTION_POINTER_UP | (pointerIndex << MotionEvent.ACTION_POINTER_INDEX_SHIFT);
+            } else if (action == MotionEvent.ACTION_DOWN) {
+                action = MotionEvent.ACTION_POINTER_DOWN | (pointerIndex << MotionEvent.ACTION_POINTER_INDEX_SHIFT);
+            }
+        }
+
+        /* If the input device is a mouse (on API >= 23):
+         *   - the first button pressed must first generate ACTION_DOWN;
+         *   - all button pressed (including the first one) must generate ACTION_BUTTON_PRESS;
+         *   - all button released (including the last one) must generate ACTION_BUTTON_RELEASE;
+         *   - the last button released must in addition generate ACTION_UP.
+         *
+         * Otherwise, Chrome does not work properly: <https://github.com/Genymobile/scrcpy/issues/3635>
+         */
+        if (Build.VERSION.SDK_INT >= AndroidVersions.API_23_ANDROID_6_0 && source == InputDevice.SOURCE_MOUSE) {
+            if (action == MotionEvent.ACTION_DOWN) {
+                if (actionButton == buttons) {
+                    // First button pressed: ACTION_DOWN
+                    MotionEvent downEvent = MotionEvent.obtain(lastTouchDown, now, MotionEvent.ACTION_DOWN, pointerCount, pointerProperties,
+                            pointerCoords, 0, buttons, 1f, 1f, DEFAULT_DEVICE_ID, 0, source, 0);
+                    if (!Device.injectEvent(downEvent, targetDisplayId, Device.INJECT_MODE_ASYNC)) {
+                        return false;
+                    }
+                }
+
+                // Any button pressed: ACTION_BUTTON_PRESS
+                MotionEvent pressEvent = MotionEvent.obtain(lastTouchDown, now, MotionEvent.ACTION_BUTTON_PRESS, pointerCount, pointerProperties,
+                        pointerCoords, 0, buttons, 1f, 1f, DEFAULT_DEVICE_ID, 0, source, 0);
+                if (!InputManager.setActionButton(pressEvent, actionButton)) {
+                    return false;
+                }
+                if (!Device.injectEvent(pressEvent, targetDisplayId, Device.INJECT_MODE_ASYNC)) {
+                    return false;
+                }
+
+                return true;
+            }
+
+            if (action == MotionEvent.ACTION_UP) {
+                // Any button released: ACTION_BUTTON_RELEASE
+                MotionEvent releaseEvent = MotionEvent.obtain(lastTouchDown, now, MotionEvent.ACTION_BUTTON_RELEASE, pointerCount, pointerProperties,
+                        pointerCoords, 0, buttons, 1f, 1f, DEFAULT_DEVICE_ID, 0, source, 0);
+                if (!InputManager.setActionButton(releaseEvent, actionButton)) {
+                    return false;
+                }
+                if (!Device.injectEvent(releaseEvent, targetDisplayId, Device.INJECT_MODE_ASYNC)) {
+                    return false;
+                }
+
+                if (buttons == 0) {
+                    // Last button released: ACTION_UP
+                    MotionEvent upEvent = MotionEvent.obtain(lastTouchDown, now, MotionEvent.ACTION_UP, pointerCount, pointerProperties,
+                            pointerCoords, 0, buttons, 1f, 1f, DEFAULT_DEVICE_ID, 0, source, 0);
+                    if (!Device.injectEvent(upEvent, targetDisplayId, Device.INJECT_MODE_ASYNC)) {
+                        return false;
+                    }
+                }
+
+                return true;
+            }
+        }
+
+        MotionEvent event = MotionEvent.obtain(lastTouchDown, now, action, pointerCount, pointerProperties, pointerCoords, 0, buttons, 1f, 1f,
+                DEFAULT_DEVICE_ID, 0, source, 0);
+        return Device.injectEvent(event, targetDisplayId, Device.INJECT_MODE_ASYNC);
     }
 
-    if (r == -1) {
-        return NULL;
+    private boolean injectScroll(Position position, float hScroll, float vScroll, int buttons) {
+        long now = SystemClock.uptimeMillis();
+
+        Pair<Point, Integer> pair = getEventPointAndDisplayId(position);
+        if (pair == null) {
+            return false;
+        }
+
+        Point point = pair.first;
+        int targetDisplayId = pair.second;
+
+        MotionEvent.PointerProperties props = pointerProperties[0];
+        props.id = 0;
+
+        MotionEvent.PointerCoords coords = pointerCoords[0];
+        coords.x = point.getX();
+        coords.y = point.getY();
+        coords.setAxisValue(MotionEvent.AXIS_HSCROLL, hScroll);
+        coords.setAxisValue(MotionEvent.AXIS_VSCROLL, vScroll);
+
+        MotionEvent event = MotionEvent.obtain(lastTouchDown, now, MotionEvent.ACTION_SCROLL, 1, pointerProperties, pointerCoords, 0, buttons, 1f, 1f,
+                DEFAULT_DEVICE_ID, 0, InputDevice.SOURCE_MOUSE, 0);
+        return Device.injectEvent(event, targetDisplayId, Device.INJECT_MODE_ASYNC);
     }
 
-    assert((size_t) r < sizeof(buf));
-    buf[r] = '\0';
-    size_t len = strcspn(buf, " \r\n");
-    buf[len] = '\0';
-
-    return strdup(buf);
-}
-
-char *
-sc_adb_get_device_ip(struct sc_intr *intr, const char *serial, unsigned flags) {
-    assert(serial);
-    const char *const argv[] =
-        SC_ADB_COMMAND("-s", serial, "shell", "ip", "route");
-
-    sc_pipe pout;
-    sc_pid pid = sc_adb_execute_p(argv, flags, &pout);
-    if (pid == SC_PROCESS_NONE) {
-        LOGD("Could not execute \"ip route\"");
-        return NULL;
+    /**
+     * Schedule a call to set display power to off after a small delay.
+     */
+    private static void scheduleDisplayPowerOff(int displayId) {
+        EXECUTOR.schedule(() -> {
+            Ln.i("Forcing display off");
+            Device.setDisplayPower(displayId, false);
+        }, 200, TimeUnit.MILLISECONDS);
     }
 
-    // "adb shell ip route" output should contain only a few lines
-    char buf[1024];
-    ssize_t r = sc_pipe_read_all_intr(intr, pid, pout, buf, sizeof(buf) - 1);
-    sc_pipe_close(pout);
+    private boolean pressBackOrTurnScreenOn(int action) {
+        if (displayId == Device.DISPLAY_ID_NONE || Device.isScreenOn(displayId)) {
+            return injectKeyEvent(action, KeyEvent.KEYCODE_BACK, 0, 0, Device.INJECT_MODE_ASYNC);
+        }
 
-    bool ok = process_check_success_intr(intr, pid, "ip route", flags);
-    if (!ok) {
-        return NULL;
+        // Screen is off
+        // Only press POWER on ACTION_DOWN
+        if (action != KeyEvent.ACTION_DOWN) {
+            // do nothing,
+            return true;
+        }
+
+        if (keepDisplayPowerOff) {
+            assert displayId != Device.DISPLAY_ID_NONE;
+            scheduleDisplayPowerOff(displayId);
+        }
+        return pressReleaseKeycode(KeyEvent.KEYCODE_POWER, Device.INJECT_MODE_ASYNC);
     }
 
-    if (r == -1) {
-        return NULL;
+    private void getClipboard(int copyKey) {
+        // On Android >= 7, press the COPY or CUT key if requested
+        if (copyKey != ControlMessage.COPY_KEY_NONE && Build.VERSION.SDK_INT >= AndroidVersions.API_24_ANDROID_7_0 && supportsInputEvents) {
+            int key = copyKey == ControlMessage.COPY_KEY_COPY ? KeyEvent.KEYCODE_COPY : KeyEvent.KEYCODE_CUT;
+            // Wait until the event is finished, to ensure that the clipboard text we read just after is the correct one
+            pressReleaseKeycode(key, Device.INJECT_MODE_WAIT_FOR_FINISH);
+        }
+
+        // If clipboard autosync is enabled, then the device clipboard is synchronized to the computer clipboard whenever it changes, in
+        // particular when COPY or CUT are injected, so it should not be synchronized twice. On Android < 7, do not synchronize at all rather than
+        // copying an old clipboard content.
+        if (!clipboardAutosync) {
+            String clipboardText = Device.getClipboardText();
+            if (clipboardText != null) {
+                DeviceMessage msg = DeviceMessage.createClipboard(clipboardText);
+                sender.send(msg);
+            }
+        }
     }
 
-    assert((size_t) r < sizeof(buf));
-    if (r == sizeof(buf) - 1)  {
-        // The implementation assumes that the output of "ip route" fits in the
-        // buffer in a single pass
-        LOGW("Result of \"ip route\" does not fit in 1Kb. "
-             "Please report an issue.");
-        return NULL;
+    private boolean setClipboard(String text, boolean paste, long sequence) {
+        isSettingClipboard.set(true);
+        boolean ok = Device.setClipboardText(text);
+        isSettingClipboard.set(false);
+        if (ok) {
+            Ln.i("Device clipboard set");
+        }
+
+        // On Android >= 7, also press the PASTE key if requested
+        if (paste && Build.VERSION.SDK_INT >= AndroidVersions.API_24_ANDROID_7_0 && supportsInputEvents) {
+            pressReleaseKeycode(KeyEvent.KEYCODE_PASTE, Device.INJECT_MODE_ASYNC);
+        }
+
+        if (sequence != ControlMessage.SEQUENCE_INVALID) {
+            // Acknowledgement requested
+            DeviceMessage msg = DeviceMessage.createAckClipboard(sequence);
+            sender.send(msg);
+        }
+
+        return ok;
     }
 
-    // It is parsed as a NUL-terminated string
-    buf[r] = '\0';
-
-    return sc_adb_parse_device_ip(buf);
-}
-
-uint16_t
-sc_adb_get_device_sdk_version(struct sc_intr *intr, const char *serial) {
-    char *sdk_version =
-        sc_adb_getprop(intr, serial, "ro.build.version.sdk", SC_ADB_SILENT);
-    if (!sdk_version) {
-        return 0;
+    private void openHardKeyboardSettings() {
+        Intent intent = new Intent("android.settings.HARD_KEYBOARD_SETTINGS");
+        ServiceManager.getActivityManager().startActivity(intent);
     }
 
-    long value;
-    bool ok = sc_str_parse_integer(sdk_version, &value);
-    free(sdk_version);
-    if (!ok || value < 0 || value > 0xFFFF) {
-        return 0;
+    private boolean injectKeyEvent(int action, int keyCode, int repeat, int metaState, int injectMode) {
+        return Device.injectKeyEvent(action, keyCode, repeat, metaState, getActionDisplayId(), injectMode);
     }
 
-    return value;
+    private boolean pressReleaseKeycode(int keyCode, int injectMode) {
+        return Device.pressReleaseKeycode(keyCode, getActionDisplayId(), injectMode);
+    }
+
+    private int getActionDisplayId() {
+        if (displayId != Device.DISPLAY_ID_NONE) {
+            // Real screen mirrored, use the source display id
+            return displayId;
+        }
+
+        // Virtual display created by --new-display, use the virtualDisplayId
+        DisplayData data = displayData.get();
+        if (data == null) {
+            // If no virtual display id is initialized yet, use the main display id
+            return 0;
+        }
+
+        return data.virtualDisplayId;
+    }
+
+    private void startAppAsync(String name) {
+        if (startAppExecutor == null) {
+            startAppExecutor = Executors.newSingleThreadExecutor();
+        }
+
+        // Listing and selecting the app may take a lot of time
+        startAppExecutor.submit(() -> startApp(name));
+    }
+
+    private void startApp(String name) {
+        boolean forceStopBeforeStart = name.startsWith("+");
+        if (forceStopBeforeStart) {
+            name = name.substring(1);
+        }
+
+        DeviceApp app;
+        boolean searchByName = name.startsWith("?");
+        if (searchByName) {
+            name = name.substring(1);
+
+            Ln.i("Processing Android apps... (this may take some time)");
+            List<DeviceApp> apps = Device.findByName(name);
+            if (apps.isEmpty()) {
+                Ln.w("No app found for name \"" + name + "\"");
+                return;
+            }
+
+            if (apps.size() > 1) {
+                String title = "No unique app found for name \"" + name + "\":";
+                Ln.w(LogUtils.buildAppListMessage(title, apps));
+                return;
+            }
+
+            app = apps.get(0);
+        } else {
+            app = Device.findByPackageName(name);
+            if (app == null) {
+                Ln.w("No app found for package \"" + name + "\"");
+                return;
+            }
+        }
+
+        int startAppDisplayId = getStartAppDisplayId();
+        if (startAppDisplayId == Device.DISPLAY_ID_NONE) {
+            Ln.e("No known display id to start app \"" + name + "\"");
+            return;
+        }
+
+        Ln.i("Starting app \"" + app.getName() + "\" [" + app.getPackageName() + "] on display " + startAppDisplayId + "...");
+        Device.startApp(app.getPackageName(), startAppDisplayId, forceStopBeforeStart);
+    }
+
+    private int getStartAppDisplayId() {
+        if (displayId != Device.DISPLAY_ID_NONE) {
+            return displayId;
+        }
+
+        // Mirroring a new virtual display id (using --new-display-id feature)
+        try {
+            // Wait for at most 1 second until a virtual display id is known
+            DisplayData data = waitDisplayData(1000);
+            if (data != null) {
+                return data.virtualDisplayId;
+            }
+        } catch (InterruptedException e) {
+            // do nothing
+        }
+
+        // No display id available
+        return Device.DISPLAY_ID_NONE;
+    }
+
+    private DisplayData waitDisplayData(long timeoutMillis) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + timeoutMillis;
+
+        synchronized (displayDataAvailable) {
+            DisplayData data = displayData.get();
+            while (data == null) {
+                long timeout = deadline - System.currentTimeMillis();
+                if (timeout < 0) {
+                    return null;
+                }
+                if (timeout > 0) {
+                    displayDataAvailable.wait(timeout);
+                }
+                data = displayData.get();
+            }
+
+            return data;
+        }
+    }
+
+    private void setDisplayPower(boolean on) {
+        // Change the power of the main display when mirroring a virtual display
+        int targetDisplayId = displayId != Device.DISPLAY_ID_NONE ? displayId : 0;
+        boolean setDisplayPowerOk = Device.setDisplayPower(targetDisplayId, on);
+        if (setDisplayPowerOk) {
+            // Do not keep display power off for virtual displays: MOD+p must wake up the physical device
+            keepDisplayPowerOff = displayId != Device.DISPLAY_ID_NONE && !on;
+            Ln.i("Device display turned " + (on ? "on" : "off"));
+            if (cleanUp != null) {
+                boolean mustRestoreOnExit = !on;
+                cleanUp.setRestoreDisplayPower(mustRestoreOnExit);
+            }
+        }
+    }
+
+    private void resetVideo() {
+        if (surfaceCapture != null) {
+            Ln.i("Video capture reset");
+            surfaceCapture.requestInvalidate();
+        }
+    }
 }
